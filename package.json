@@ -1,0 +1,41 @@
+{
+  "name": "@frapetti-dev/pi-ssh",
+  "version": "0.1.0",
+  "description": "Safe SSH connect, remote commands and file transfer for omp",
+  "author": "frapetti-dev (https://github.com/frapetti-dev)",
+  "type": "module",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "keywords": [
+    "omp-plugin",
+    "omp",
+    "pi-package",
+    "ssh",
+    "sftp",
+    "extension"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/frapetti-dev/ppi-ssh.git"
+  },
+  "homepage": "https://github.com/frapetti-dev/ppi-ssh#readme",
+  "bugs": "https://github.com/frapetti-dev/ppi-ssh/issues",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "ssh-config": "^5.3.0",
+    "ssh2": "^1.17.0"
+  },
+  "devDependencies": {
+    "@types/ssh2": "^1.15.6"
+  }
+}

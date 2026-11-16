@@ -5,6 +5,7 @@
   "author": "frapetti-dev (https://github.com/frapetti-dev)",
   "type": "module",
   "files": [
+    "dist",
     "src",
     "README.md"
   ],
@@ -26,16 +27,15 @@
     "registry": "https://npm.pkg.github.com"
   },
   "omp": {
-    "extensions": ["./src/index.ts"]
+    "extensions": ["./dist/index.js"]
   },
   "scripts": {
+    "build": "bun build src/index.ts --target bun --outdir dist --external \"@oh-my-pi/*\" --external \"*.node\" --external cpu-features",
     "test": "bun test"
   },
-  "dependencies": {
+  "devDependencies": {
+    "@types/ssh2": "^1.15.6",
     "ssh-config": "^5.3.0",
     "ssh2": "^1.17.0"
-  },
-  "devDependencies": {
-    "@types/ssh2": "^1.15.6"
   }
 }

@@ -13,6 +13,8 @@ export interface Prompter {
 
 /** Passed to `sudo -p`; seeing it on stderr means sudo is waiting for the password on stdin. */
 export const SUDO_PROMPT = "[pi-ssh:sudo-password]";
+/** SUDO_PROMPT as printed: verbatim (sudo) or wrapped as `[sudo: <prompt>] Password: ` (sudo-rs). */
+const SUDO_PROMPT_TEXT = /(?:\[sudo: )?\[pi-ssh:sudo-password\](?:\] [^\r\n]*?: ?)?/g;
 
 export interface ExecOptions {
 	signal?: AbortSignal;
@@ -81,7 +83,7 @@ function createExec(client: Client) {
 					signal: extra.signal ?? exitSignal,
 					timedOut: extra.timedOut ?? false,
 					stdout,
-					stderr: opts.sudoPassword ? stderr.replaceAll(SUDO_PROMPT, "") : stderr,
+					stderr: opts.sudoPassword ? stderr.replace(SUDO_PROMPT_TEXT, "") : stderr,
 					durationMs: Date.now() - start,
 				});
 			};
@@ -128,7 +130,7 @@ function createExec(client: Client) {
 							// keep the tail so a marker split across chunks is found once; scan stays linear
 							scanFrom = Math.max(scanFrom, stderr.length - SUDO_PROMPT.length + 1);
 							// shortcut: a marker split across chunks can flash in live partial output; the final result is clean. Upgrade if users see it.
-							chunk = chunk.replaceAll(SUDO_PROMPT, "");
+							chunk = chunk.replace(SUDO_PROMPT_TEXT, "");
 						}
 					}
 					opts.onData?.(which, chunk);

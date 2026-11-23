@@ -34,7 +34,7 @@ Restart omp afterwards.
 | Tool | Purpose |
 | --- | --- |
 | `ssh_hosts` | List aliases from `~/.ssh/config` with their Connection state. |
-| `ssh_exec` | Run one non-interactive command (`host`, `command`, optional `cwd`, `timeoutSec` up to 900, default 120). |
+| `ssh_exec` | Run one non-interactive command (`host`, `command`, optional `cwd`, `timeoutSec` up to 900, default 120, `sudo`, `async`). Like bash, long commands move to the background automatically; `async: true` backgrounds at once. Monitor with `read proc://<id>`, `wait`, or cancel via `proc://<id>/kill`. |
 | `ssh_transfer` | Upload or download a file or directory tree. |
 
 The agent connects lazily by `host`. Output keeps the first and last 200 lines per stream, capped at 64 KB.

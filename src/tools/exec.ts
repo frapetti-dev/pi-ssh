@@ -2,11 +2,10 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { SUDO_PROMPT } from "../core/connections";
 import { classify } from "../core/classify";
 import type { HostSpec } from "../core/hosts";
-import { type ExecDetails, exitLabel, formatExecText, truncateStream } from "../core/output";
+import { type ExecDetails, formatExecText, truncateStream } from "../core/output";
 import { loadRules } from "../core/settings";
 import type { Runtime } from "../runtime";
 import { openApproval } from "../ui/approval";
-import { n } from "../ui/nodes";
 import { openSecret } from "../ui/secret";
 
 const DEFAULT_TIMEOUT_SEC = 120;
@@ -80,8 +79,86 @@ export async function runCommand(
 
 let lastWarning: string | undefined;
 
-export function registerExecTool(pi: ExtensionAPI, rt: Runtime): void {
+/** Shape of the internal omp modules used below; they have no public typings. */
+interface JobManager {
+	atCapacity: boolean;
+	register(
+		type: string,
+		label: string,
+		run: (job: {
+			jobId: string;
+			signal: AbortSignal;
+			reportProgress(text: string, details: { output: string }): unknown;
+		}) => Promise<string>,
+		opts: { ownerId?: string; foreground: boolean },
+	): string;
+	releaseForegroundJob(id: string): void;
+	backgroundJob(id: string): void;
+	cancel(id: string): void;
+}
+interface JobsModule {
+	AsyncJobManager: { instance(): JobManager | undefined };
+	formatAsyncJobLabel(label: string): string;
+	raceJobSettlement<T>(p: Promise<T>, waitMs: number, signal?: AbortSignal): Promise<T | { kind: "running" } | { kind: "aborted" }>;
+	resolveAutoBackgroundWaitMs(thresholdMs: number, timeoutMs?: number): number;
+}
+interface SettingsRegistry {
+	lookup(id: string): { get(settings: unknown): unknown } | undefined;
+}
+interface ShellRenderer {
+	describeCall: unknown;
+	describeResult(result: unknown, opts: unknown, args: unknown): unknown;
+}
+interface BashUi {
+	createShellRenderer(opts: {
+		resolveTitle(a?: ExecArgs): string;
+		resolveCommand(a?: ExecArgs): string | undefined;
+		resolveCwd(a?: ExecArgs): string | undefined;
+		showHeader: boolean;
+	}): ShellRenderer;
+}
+interface ExecArgs {
+	host?: string;
+	command?: string;
+	cwd?: string;
+	sudo?: boolean;
+}
+interface ExecResult {
+	content: { type: "text"; text: string }[];
+	details: ExecDetails | { error: string };
+	isError?: true;
+}
+
+export async function registerExecTool(pi: ExtensionAPI, rt: Runtime): Promise<void> {
 	const z = pi.zod;
+	// omp has no public job/renderer API; these internal modules may move, so each degrades instead of breaking the extension.
+	const [jobs, registry, bashUi] = await Promise.all([
+		import("@oh-my-pi/pi-coding-agent/async").then(m => m as JobsModule, () => undefined),
+		import("@oh-my-pi/pi-coding-agent/config/registry").then(m => m as SettingsRegistry, () => undefined),
+		import("@oh-my-pi/pi-tui/tools/bash").then(m => m as BashUi, () => undefined),
+	]);
+	const setting = <T>(id: string): T | undefined =>
+		pi.pi?.settings ? (registry?.lookup(id)?.get(pi.pi.settings) as T | undefined) : undefined;
+	const shell = bashUi?.createShellRenderer({
+		resolveTitle: a => (a?.host ? `SSH · ${a.host}${a.sudo ? " (sudo)" : ""}` : "SSH"),
+		resolveCommand: a => a?.command,
+		resolveCwd: a => a?.cwd,
+		showHeader: false,
+	});
+	const card = (result: ExecResult, opts: unknown, args: unknown) => {
+		const d = result.details;
+		if (!("hostId" in d)) return shell!.describeResult(result, opts, args); // errors render as a failed bash run
+		const text = [d.stdout.trimEnd(), d.stderr.trimEnd()].filter(Boolean).join("\n");
+		return shell!.describeResult(
+			{
+				content: [{ type: "text", text }],
+				isError: result.isError === true || d.signal !== undefined,
+				details: { exitCode: d.exitCode ?? undefined, timedOut: d.timedOut, wallTimeMs: d.durationMs, async: d.async },
+			},
+			opts,
+			args,
+		);
+	};
 	pi.registerTool({
 		name: "ssh_exec",
 		label: "SSH exec",
@@ -90,7 +167,8 @@ export function registerExecTool(pi: ExtensionAPI, rt: Runtime): void {
 			"Read-only allowlisted commands (ls, cat, grep, git status, ...) run immediately; any other command, " +
 			"pipelines with redirects or command substitution included, needs the user's approval first. " +
 			"There is no interactive shell, no PTY and no stdin. Output is truncated to the first and last 200 lines. " +
-			"Set sudo: true to run as root; never prefix the command with sudo yourself (there is no TTY for its password prompt). Every sudo command needs the user's approval.",
+			"Set sudo: true to run as root; never prefix the command with sudo yourself (there is no TTY for its password prompt). Every sudo command needs the user's approval. " +
+			"Set async: true to run it in the background, like bash.",
 		parameters: z.object({
 			host: z.string().describe("~/.ssh/config alias or user@host[:port]"),
 			command: z.string().describe("Shell command to run on the Host"),
@@ -100,6 +178,12 @@ export function registerExecTool(pi: ExtensionAPI, rt: Runtime): void {
 				.boolean()
 				.optional()
 				.describe("Run the command as root via sudo; the user is asked for the sudo password if the Host needs one"),
+			async: z
+				.boolean()
+				.optional()
+				.describe(
+					"Run in the background: returns a job id at once and the result arrives as a follow-up. Long commands are backgrounded automatically. Monitor with read proc://<id>, block with wait, cancel by writing proc://<id>/kill.",
+				),
 		}),
 		loadMode: "essential",
 		approval: "read",
@@ -139,69 +223,118 @@ export function registerExecTool(pi: ExtensionAPI, rt: Runtime): void {
 				}
 			}
 
-			try {
-				const details = await runCommand(rt, ctx, spec, params.command, {
-					cwd: params.cwd,
-					timeoutSec: params.timeoutSec,
-					signal,
-					approvedBy,
-					sudoPassword: params.sudo
-						? async () => {
-								const cached = rt.sudoPasswords.get(spec.id);
-								if (cached !== undefined) return cached;
-								const answer = await openSecret(ctx, `sudo password for ${spec.user}@${spec.hostName}`, true);
-								if (answer?.remember) rt.sudoPasswords.set(spec.id, answer.value);
-								return answer?.value;
-							}
-						: undefined,
-					onPartial: partial =>
-						onUpdate?.({ content: [{ type: "text", text: formatExecText(partial) }], details: partial }),
-				});
-				if (details.signal === "SUDO_DENIED") {
-					rt.sudoPasswords.delete(spec.id);
-					return errorResult(`sudo rejected the password on ${spec.id}; the command did not run.`);
+			const run = async (jobSignal: AbortSignal | undefined, onPartial: (d: ExecDetails) => void): Promise<ExecResult> => {
+				try {
+					const details = await runCommand(rt, ctx, spec, params.command, {
+						cwd: params.cwd,
+						timeoutSec: params.timeoutSec,
+						signal: jobSignal,
+						approvedBy,
+						sudoPassword: params.sudo
+							? async () => {
+									const cached = rt.sudoPasswords.get(spec.id);
+									if (cached !== undefined) return cached;
+									const answer = await openSecret(ctx, `sudo password for ${spec.user}@${spec.hostName}`, true);
+									if (answer?.remember) rt.sudoPasswords.set(spec.id, answer.value);
+									return answer?.value;
+								}
+							: undefined,
+						onPartial,
+					});
+					if (details.signal === "SUDO_DENIED") {
+						rt.sudoPasswords.delete(spec.id);
+						return errorResult(`sudo rejected the password on ${spec.id}; the command did not run.`);
+					}
+					if (details.signal === "SUDO_CANCELLED") {
+						return errorResult(`User cancelled the sudo password prompt on ${spec.id}.`);
+					}
+					return { content: [{ type: "text", text: formatExecText(details) }], details };
+				} catch (e) {
+					return errorResult(`SSH to ${spec.id} failed: ${e instanceof Error ? e.message : String(e)}`);
 				}
-				if (details.signal === "SUDO_CANCELLED") {
-					return errorResult(`User cancelled the sudo password prompt on ${spec.id}.`);
+			};
+			const toUpdate = (d: ExecDetails) => ({ content: [{ type: "text" as const, text: formatExecText(d) }], details: d });
+			const empty = shape(
+				{ hostId: spec.id, command: params.command, cwd: params.cwd, approvedBy },
+				{ code: null, timedOut: false, stdout: "", stderr: "", durationMs: 0 },
+			);
+
+			const startJob = (mgr: JobManager, foreground: boolean) => {
+				let backgrounded = !foreground;
+				let latest: ExecDetails | undefined;
+				const done = Promise.withResolvers<ExecResult>();
+				const label = jobs!.formatAsyncJobLabel(`${spec.id}: ${params.command}`);
+				const jobId = mgr.register(
+					"ssh",
+					label,
+					async ({ jobId, signal: jobSignal, reportProgress }) => {
+						const emit = (d: ExecDetails, state: NonNullable<ExecDetails["async"]>["state"]) => {
+							latest = d;
+							const text = formatExecText(d);
+							void reportProgress(text, { output: text });
+							onUpdate?.(toUpdate(backgrounded ? { ...d, async: { state, jobId, type: "ssh" } } : d));
+						};
+						const result = await run(jobSignal, d => emit(d, "running"));
+						done.resolve(result);
+						const d = result.details;
+						const text = result.content[0].text;
+						const failed = !("hostId" in d) || d.exitCode !== 0 || d.timedOut || d.signal !== undefined;
+						if ("hostId" in d) emit(d, jobSignal.aborted ? "cancelled" : failed ? "failed" : "completed");
+						if (failed) throw new Error(text);
+						return text;
+					},
+					{ ownerId: ctx.agent?.id, foreground },
+				);
+				return {
+					jobId,
+					completion: done.promise,
+					latest: () => latest,
+					background: () => {
+						backgrounded = true;
+					},
+				};
+			};
+			const notice = (jobId: string) =>
+				`Backgrounded as job ${jobId} (killed once it has run ${params.timeoutSec ?? DEFAULT_TIMEOUT_SEC}s in total); its result arrives as a follow-up the moment it finishes. Do NOT poll: read proc://${jobId} for progress, call wait to block on it, or write proc://${jobId}/kill to cancel.`;
+			const backgroundResult = (jobId: string, d: ExecDetails): ExecResult => ({
+				content: [{ type: "text", text: d.stdout || d.stderr ? `${formatExecText(d)}\n\n${notice(jobId)}` : notice(jobId) }],
+				details: { ...d, async: { state: "running", jobId, type: "ssh" } },
+			});
+
+			const mgr = jobs?.AsyncJobManager.instance();
+			if (params.async) {
+				if (!mgr) return errorResult("Background jobs are unavailable in this omp build.");
+				if (setting<boolean>("async.enabled") === false) return errorResult("Async execution is disabled. Enable async.enabled to use async mode.");
+				if (mgr.atCapacity) return errorResult("Background job limit reached. Wait for running jobs to finish or cancel one.");
+				try {
+					await rt.pool.get(spec, rt.prompter(ctx)); // host-key/credential prompts happen in the call, not later
+				} catch (e) {
+					return errorResult(`SSH to ${spec.id} failed: ${e instanceof Error ? e.message : String(e)}`);
 				}
-				return { content: [{ type: "text", text: formatExecText(details) }], details };
-			} catch (e) {
-				return errorResult(`SSH to ${spec.id} failed: ${e instanceof Error ? e.message : String(e)}`);
+				const job = startJob(mgr, false);
+				return backgroundResult(job.jobId, empty);
 			}
+			if (mgr && !mgr.atCapacity && setting<boolean>("bash.autoBackground.enabled") !== false) {
+				const timeoutMs = (params.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
+				const waitMs = jobs!.resolveAutoBackgroundWaitMs(Math.floor(setting<number>("bash.autoBackground.thresholdMs") ?? 60_000), timeoutMs);
+				const job = startJob(mgr, waitMs > 0);
+				if (waitMs === 0) return backgroundResult(job.jobId, empty);
+				const r = await jobs!.raceJobSettlement(job.completion.then(result => ({ kind: "completed" as const, result })), waitMs, signal);
+				if (r.kind === "completed") {
+					mgr.releaseForegroundJob(job.jobId);
+					return r.result;
+				}
+				if (r.kind === "aborted") {
+					mgr.cancel(job.jobId);
+					mgr.releaseForegroundJob(job.jobId);
+					return errorResult(`Remote command on ${spec.id} aborted.`);
+				}
+				job.background();
+				mgr.backgroundJob(job.jobId);
+				return backgroundResult(job.jobId, job.latest() ?? empty);
+			}
+			return run(signal, d => onUpdate?.(toUpdate(d)));
 		},
-		describeCall(args) {
-			return {
-				tool: {
-					title: "SSH",
-					target: args.command,
-					targetKind: "command",
-					badges: [{ text: args.host, tone: "accent" }, ...(args.sudo ? [{ text: "sudo", tone: "warning" as const }] : [])],
-				},
-			};
-		},
-		describeResult(result, _opts, args) {
-			const d = result.details as ExecDetails | { error: string } | undefined;
-			if (!d || !("hostId" in d)) return undefined;
-			const failed = d.exitCode !== 0 || d.timedOut;
-			return {
-				tool: {
-					title: "SSH",
-					target: d.command,
-					targetKind: "command",
-					meta: [d.hostId, `exit ${exitLabel(d)}`, `${(d.durationMs / 1000).toFixed(1)}s`],
-					badges: [
-						{ text: d.approvedBy, tone: d.approvedBy === "allowlist" ? "success" : "warning" },
-						...(args.sudo ? [{ text: "sudo", tone: "warning" as const }] : []),
-					],
-					exit: d.exitCode === 0 ? undefined : d.exitCode,
-					note: d.timedOut ? "timed out" : d.truncated ? "truncated" : undefined,
-				},
-				open: failed,
-				body: [
-					...(d.stdout ? [n("ansi", { text: d.stdout })] : []),
-					...(d.stderr ? [n("section", { head: "stderr" }, [n("ansi", { text: d.stderr })], "stderr")] : []),
-				],
-			};
-		},
+		...(shell && { describeCall: shell.describeCall, describeResult: card, mergeCallAndResult: true, inline: true }),
 	});
 }

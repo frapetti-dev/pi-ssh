@@ -137,7 +137,8 @@ function handleClient(client: ServerClient, opts: TestServerOptions): void {
 					stream.exit(3);
 					stream.end();
 				} else if (info.command.includes(SUDO_PROMPT)) {
-					stream.stderr.write(SUDO_PROMPT);
+					const prompt = info.command.startsWith("sudo-rs ") ? `[sudo: ${SUDO_PROMPT}] Password: ` : SUDO_PROMPT;
+					stream.stderr.write(prompt);
 					let buf = "";
 					stream.on("data", (d: Buffer) => {
 						buf += d.toString();
@@ -148,7 +149,7 @@ function handleClient(client: ServerClient, opts: TestServerOptions): void {
 							stream.write("root\n");
 							stream.exit(0);
 							stream.end();
-						} else stream.stderr.write(`Sorry, try again.\n${SUDO_PROMPT}`);
+						} else stream.stderr.write(`Sorry, try again.\n${prompt}`);
 					});
 				}
 				// any other command (e.g. "sleep") never exits

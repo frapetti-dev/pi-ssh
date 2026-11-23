@@ -215,6 +215,18 @@ describe("sudo", () => {
 		conn.close();
 	});
 
+	test("sudo-rs wrapped prompt leaves no residue", async () => {
+		const rs = `sudo-rs -S -p '${SUDO_PROMPT}' -- sh -c id`;
+		const conn = await makePool().get(spec, prompter());
+		const ok = await conn.exec(rs, { timeoutMs: 5000, sudoPassword: async () => "pw" });
+		expect(ok).toMatchObject({ stdout: "root\n", stderr: "", code: 0 });
+		conn.close();
+		const conn2 = await makePool().get(spec, prompter());
+		const bad = await conn2.exec(rs, { timeoutMs: 5000, sudoPassword: async () => "bad" });
+		expect(bad).toMatchObject({ signal: "SUDO_DENIED", stderr: "Sorry, try again.\n" });
+		conn2.close();
+	});
+
 	test("cancelled prompt", async () => {
 		const conn = await makePool().get(spec, prompter());
 		const r = await conn.exec(cmd, { timeoutMs: 5000, sudoPassword: async () => undefined });

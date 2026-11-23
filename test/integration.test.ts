@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { utils } from "ssh2";
-import { ConnectionPool, type Prompter } from "../src/core/connections";
+import { ConnectionPool, type Prompter, SUDO_PROMPT } from "../src/core/connections";
 import type { HostSpec } from "../src/core/hosts";
 import { hostField, keyInfo } from "../src/core/known-hosts";
 import { planTransfer, runTransfer } from "../src/core/transfer";
@@ -186,6 +186,54 @@ describe("connection", () => {
 		setTimeout(() => controller.abort(), 100);
 		const aborted = await conn.exec("sleep", { timeoutMs: 5000, signal: controller.signal });
 		expect(aborted).toMatchObject({ code: null, signal: "ABORTED", timedOut: false });
+		conn.close();
+	});
+});
+
+describe("sudo", () => {
+	const cmd = `sudo -S -p '${SUDO_PROMPT}' -- sh -c id`;
+
+	test("right password runs the command", async () => {
+		const conn = await makePool().get(spec, prompter());
+		const r = await conn.exec(cmd, { timeoutMs: 5000, sudoPassword: async () => "pw" });
+		expect(r).toMatchObject({ stdout: "root\n", stderr: "", code: 0 });
+		conn.close();
+	});
+
+	test("wrong password is denied after one prompt", async () => {
+		const conn = await makePool().get(spec, prompter());
+		let calls = 0;
+		const r = await conn.exec(cmd, {
+			timeoutMs: 5000,
+			sudoPassword: async () => {
+				calls++;
+				return "bad";
+			},
+		});
+		expect(r).toMatchObject({ code: null, signal: "SUDO_DENIED", stderr: "Sorry, try again.\n" });
+		expect(calls).toBe(1);
+		conn.close();
+	});
+
+	test("cancelled prompt", async () => {
+		const conn = await makePool().get(spec, prompter());
+		const r = await conn.exec(cmd, { timeoutMs: 5000, sudoPassword: async () => undefined });
+		expect(r).toMatchObject({ signal: "SUDO_CANCELLED" });
+		conn.close();
+	});
+
+	test("no prompt means the password is never requested", async () => {
+		const conn = await makePool().get(spec, prompter());
+		let calls = 0;
+		const r = await conn.exec("echo hi", {
+			timeoutMs: 5000,
+			sudoPassword: async () => {
+				calls++;
+				return "pw";
+			},
+		});
+		expect(r.stdout).toBe("hi\n");
+		expect(calls).toBe(0);
 		conn.close();
 	});
 });

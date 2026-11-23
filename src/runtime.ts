@@ -17,6 +17,8 @@ export interface Runtime {
 	pool: ConnectionPool;
 	/** Host ids with an "Always allow on this Host" Approval; cleared on session shutdown. */
 	grants: Set<string>;
+	/** Sudo Passwords the user chose to remember, by Host id; dropped when that Host's Connection closes and on session shutdown. */
+	sudoPasswords: Map<string, string>;
 	tracker: TransferTracker;
 	rulesPath: string;
 	knownHostsPath: string;
@@ -55,6 +57,7 @@ export function createRuntime(): Runtime {
 	});
 	const tracker = new TransferTracker();
 	const grants = new Set<string>();
+	const sudoPasswords = new Map<string, string>();
 
 	let boundCtx: ExtensionContext | undefined;
 	let stopWidget: (() => void) | undefined;
@@ -63,10 +66,15 @@ export function createRuntime(): Runtime {
 		boundCtx?.ui.setStatus(STATUS_KEY, count ? `ssh: ${count} connected` : undefined);
 	};
 	pool.onChange(updateStatus);
+	pool.onChange(() => {
+		const live = new Set(pool.list().map(c => c.spec.id));
+		for (const id of sudoPasswords.keys()) if (!live.has(id)) sudoPasswords.delete(id);
+	});
 
 	return {
 		pool,
 		grants,
+		sudoPasswords,
 		tracker,
 		rulesPath: defaultRulesPath(),
 		knownHostsPath,
@@ -75,7 +83,7 @@ export function createRuntime(): Runtime {
 		resolve,
 		prompter: ctx => ({
 			confirmHostKey: info => (ctx.hasUI ? openHostKey(ctx, info) : Promise.resolve(false)),
-			askSecret: title => (ctx.hasUI ? openSecret(ctx, title) : Promise.resolve(undefined)),
+			askSecret: title => (ctx.hasUI ? openSecret(ctx, title).then(a => a?.value) : Promise.resolve(undefined)),
 		}),
 		bind(ctx) {
 			if (boundCtx === ctx) return;
@@ -87,6 +95,7 @@ export function createRuntime(): Runtime {
 		dispose() {
 			pool.closeAll();
 			grants.clear();
+			sudoPasswords.clear();
 			stopWidget?.();
 			stopWidget = undefined;
 			boundCtx?.ui.setStatus(STATUS_KEY, undefined);

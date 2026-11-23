@@ -9,7 +9,7 @@ import { n, prose } from "./nodes";
 export type ApprovalDecision = "once" | "host" | "deny";
 
 export type ApprovalRequest =
-	| { kind: "command"; host: HostSpec; command: string; cwd?: string; reason: string }
+	| { kind: "command"; host: HostSpec; command: string; cwd?: string; reason: string; sudo?: boolean }
 	| {
 			kind: "transfer";
 			host: HostSpec;
@@ -32,19 +32,28 @@ export function buildApprovalComponent(
 	const buttons: (DialogButton<ApprovalDecision> | null)[] = [
 		{ label: "Allow once", act: "once", key: "y", value: "once" },
 	];
-	if (req.kind === "command") buttons.push({ label: "Always on this host", act: "host", key: "a", value: "host" });
+	if (req.kind === "command" && !req.sudo) {
+		buttons.push({ label: "Always on this host", act: "host", key: "a", value: "host" });
+	}
 	buttons.push(null, { label: "Deny", act: "deny", key: "escape", value: "deny" });
 
 	if (req.kind === "command") {
 		const kv = [{ k: "host", v: target(req.host) }];
+		if (req.sudo) kv.push({ k: "as", v: "root (sudo)" });
 		if (req.cwd) kv.push({ k: "cwd", v: req.cwd });
 		return buildDialog(
 			{
 				head: "SSH approval",
-				title: `Run command on ${req.host.id}?`,
+				title: req.sudo ? `Run command as root on ${req.host.id}?` : `Run command on ${req.host.id}?`,
 				body: [n("kv", { items: kv }), n("code", { text: req.command, lang: "bash" }), prose(req.reason)],
 				buttons,
-				ansi: [`host: ${target(req.host)}`, ...(req.cwd ? [`cwd: ${req.cwd}`] : []), `$ ${req.command}`, req.reason],
+				ansi: [
+					`host: ${target(req.host)}`,
+					...(req.sudo ? ["as: root (sudo)"] : []),
+					...(req.cwd ? [`cwd: ${req.cwd}`] : []),
+					`$ ${req.command}`,
+					req.reason,
+				],
 				aliases: { n: "deny" },
 			},
 			done,

@@ -11,10 +11,15 @@ export interface Prompter {
 	askSecret(title: string): Promise<string | undefined>;
 }
 
+/** Passed to `sudo -p`; seeing it on stderr means sudo is waiting for the password on stdin. */
+export const SUDO_PROMPT = "[pi-ssh:sudo-password]";
+
 export interface ExecOptions {
 	signal?: AbortSignal;
 	timeoutMs: number;
 	onData?(stream: "stdout" | "stderr", chunk: string): void;
+	/** Answers SUDO_PROMPT on stderr. Resolve undefined to cancel (signal SUDO_CANCELLED); a second prompt means the password was wrong (signal SUDO_DENIED). */
+	sudoPassword?(): Promise<string | undefined>;
 }
 
 export interface ExecResult {
@@ -64,6 +69,8 @@ function createExec(client: Client) {
 			let code: number | null = null;
 			let exitSignal: string | undefined;
 			let settled = false;
+			let sudoPrompts = 0;
+			let scanFrom = 0;
 			const finish = (extra: { timedOut?: boolean; signal?: string }) => {
 				if (settled) return;
 				settled = true;
@@ -74,7 +81,7 @@ function createExec(client: Client) {
 					signal: extra.signal ?? exitSignal,
 					timedOut: extra.timedOut ?? false,
 					stdout,
-					stderr,
+					stderr: opts.sudoPassword ? stderr.replaceAll(SUDO_PROMPT, "") : stderr,
 					durationMs: Date.now() - start,
 				});
 			};
@@ -89,7 +96,15 @@ function createExec(client: Client) {
 				finish(extra);
 			};
 			const onAbort = () => kill({ signal: "ABORTED" });
+			// shortcut: timeout keeps ticking during the password dialog; pause it if users hit timeouts while typing.
 			const timer = setTimeout(() => kill({ timedOut: true }), opts.timeoutMs);
+			const answerSudo = async () => {
+				if (++sudoPrompts > 1) return kill({ signal: "SUDO_DENIED" });
+				const password = await opts.sudoPassword!();
+				if (settled) return;
+				if (password === undefined) return kill({ signal: "SUDO_CANCELLED" });
+				stream.write(`${password}\n`);
+			};
 			if (opts.signal?.aborted) {
 				onAbort();
 				return;
@@ -100,9 +115,22 @@ function createExec(client: Client) {
 				const decoder = new StringDecoder("utf8");
 				return (data: Buffer) => {
 					if (settled) return;
-					const chunk = decoder.write(data);
+					let chunk = decoder.write(data);
 					if (which === "stdout") stdout += chunk;
-					else stderr += chunk;
+					else {
+						stderr += chunk;
+						if (opts.sudoPassword) {
+							let i: number;
+							while ((i = stderr.indexOf(SUDO_PROMPT, scanFrom)) >= 0) {
+								scanFrom = i + SUDO_PROMPT.length;
+								void answerSudo().catch(() => kill({ signal: "SUDO_CANCELLED" }));
+							}
+							// keep the tail so a marker split across chunks is found once; scan stays linear
+							scanFrom = Math.max(scanFrom, stderr.length - SUDO_PROMPT.length + 1);
+							// shortcut: a marker split across chunks can flash in live partial output; the final result is clean. Upgrade if users see it.
+							chunk = chunk.replaceAll(SUDO_PROMPT, "");
+						}
+					}
 					opts.onData?.(which, chunk);
 					if (stdout.length > MAX_STREAM_CHARS || stderr.length > MAX_STREAM_CHARS) {
 						kill({ signal: "OUTPUT_LIMIT" });

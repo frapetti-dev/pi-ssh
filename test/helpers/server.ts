@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { type Connection as ServerClient, Server, type SFTPWrapper, utils } from "ssh2";
+import { SUDO_PROMPT } from "../../src/core/connections";
 
 const { STATUS_CODE, flagsToString } = utils.sftp;
 
@@ -135,6 +136,20 @@ function handleClient(client: ServerClient, opts: TestServerOptions): void {
 					stream.stderr.write("boom");
 					stream.exit(3);
 					stream.end();
+				} else if (info.command.includes(SUDO_PROMPT)) {
+					stream.stderr.write(SUDO_PROMPT);
+					let buf = "";
+					stream.on("data", (d: Buffer) => {
+						buf += d.toString();
+						if (!buf.includes("\n")) return;
+						const line = buf;
+						buf = "";
+						if (line === "pw\n") {
+							stream.write("root\n");
+							stream.exit(0);
+							stream.end();
+						} else stream.stderr.write(`Sorry, try again.\n${SUDO_PROMPT}`);
+					});
 				}
 				// any other command (e.g. "sleep") never exits
 			});

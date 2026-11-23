@@ -6,6 +6,7 @@ Domain language for the pi-ssh omp extension.
 - **Connection**: a live, authenticated link to one Host, reused by every Remote Command and Transfer to that Host until disconnected or the omp session ends.
 - **Jump Host**: a Host through which a Connection to another Host is tunnelled (one level).
 - **Remote Command**: one non-interactive command run on a Host, yielding exit status, stdout, stderr. Never an interactive shell.
+- **Background Command**: a Remote Command that keeps running after the agent's call returns, either because the agent asked for it or because it outlived the foreground wait. It can be monitored, waited for or cancelled, and its result arrives later on its own.
 - **Sudo Command**: a Remote Command run as root on its Host through sudo. It always needs an Approval of its own; the Allowlist and Host Grants never cover it.
 - **Sudo Password**: the remote user's password that sudo asks for during a Sudo Command. It is remembered in memory only when the user opts in, and forgotten when that Host's Connection closes or the omp session ends.
 - **Transfer**: a copy of a file or directory tree between the local machine and a Host (Upload or Download).

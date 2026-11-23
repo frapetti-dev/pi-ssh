@@ -20122,6 +20122,7 @@ var import_ssh2 = __toESM(require_lib2(), 1);
 import * as fs5 from "fs/promises";
 import { StringDecoder } from "string_decoder";
 var SUDO_PROMPT = "[pi-ssh:sudo-password]";
+var SUDO_PROMPT_TEXT = /(?:\[sudo: )?\[pi-ssh:sudo-password\](?:\] [^\r\n]*?: ?)?/g;
 var MAX_STREAM_CHARS = 32 * 1024 * 1024;
 var PASSWORD_TRIES = 3;
 function createExec(client) {
@@ -20151,7 +20152,7 @@ function createExec(client) {
           signal: extra.signal ?? exitSignal,
           timedOut: extra.timedOut ?? false,
           stdout,
-          stderr: opts.sudoPassword ? stderr.replaceAll(SUDO_PROMPT, "") : stderr,
+          stderr: opts.sudoPassword ? stderr.replace(SUDO_PROMPT_TEXT, "") : stderr,
           durationMs: Date.now() - start
         });
       };
@@ -20199,7 +20200,7 @@ function createExec(client) {
                 answerSudo().catch(() => kill({ signal: "SUDO_CANCELLED" }));
               }
               scanFrom = Math.max(scanFrom, stderr.length - SUDO_PROMPT.length + 1);
-              chunk = chunk.replaceAll(SUDO_PROMPT, "");
+              chunk = chunk.replace(SUDO_PROMPT_TEXT, "");
             }
           }
           opts.onData?.(which, chunk);
@@ -20868,18 +20869,49 @@ async function runCommand(rt, ctx, spec, command, opts) {
   return shape(base, result);
 }
 var lastWarning;
-function registerExecTool(pi, rt) {
+async function registerExecTool(pi, rt) {
   const z = pi.zod;
+  const [jobs, registry, bashUi] = await Promise.all([
+    import("@oh-my-pi/pi-coding-agent/async").then((m) => m, () => {
+      return;
+    }),
+    import("@oh-my-pi/pi-coding-agent/config/registry").then((m) => m, () => {
+      return;
+    }),
+    import("@oh-my-pi/pi-tui/tools/bash").then((m) => m, () => {
+      return;
+    })
+  ]);
+  const setting = (id) => pi.pi?.settings ? registry?.lookup(id)?.get(pi.pi.settings) : undefined;
+  const shell = bashUi?.createShellRenderer({
+    resolveTitle: (a) => a?.host ? `SSH \xB7 ${a.host}${a.sudo ? " (sudo)" : ""}` : "SSH",
+    resolveCommand: (a) => a?.command,
+    resolveCwd: (a) => a?.cwd,
+    showHeader: false
+  });
+  const card = (result, opts, args) => {
+    const d = result.details;
+    if (!("hostId" in d))
+      return shell.describeResult(result, opts, args);
+    const text = [d.stdout.trimEnd(), d.stderr.trimEnd()].filter(Boolean).join(`
+`);
+    return shell.describeResult({
+      content: [{ type: "text", text }],
+      isError: result.isError === true || d.signal !== undefined,
+      details: { exitCode: d.exitCode ?? undefined, timedOut: d.timedOut, wallTimeMs: d.durationMs, async: d.async }
+    }, opts, args);
+  };
   pi.registerTool({
     name: "ssh_exec",
     label: "SSH exec",
-    description: "Run one non-interactive command on a remote Host over SSH and return exit status, stdout and stderr. " + "Read-only allowlisted commands (ls, cat, grep, git status, ...) run immediately; any other command, " + "pipelines with redirects or command substitution included, needs the user's approval first. " + "There is no interactive shell, no PTY and no stdin. Output is truncated to the first and last 200 lines. " + "Set sudo: true to run as root; never prefix the command with sudo yourself (there is no TTY for its password prompt). Every sudo command needs the user's approval.",
+    description: "Run one non-interactive command on a remote Host over SSH and return exit status, stdout and stderr. " + "Read-only allowlisted commands (ls, cat, grep, git status, ...) run immediately; any other command, " + "pipelines with redirects or command substitution included, needs the user's approval first. " + "There is no interactive shell, no PTY and no stdin. Output is truncated to the first and last 200 lines. " + "Set sudo: true to run as root; never prefix the command with sudo yourself (there is no TTY for its password prompt). Every sudo command needs the user's approval. " + "Set async: true to run it in the background, like bash.",
     parameters: z.object({
       host: z.string().describe("~/.ssh/config alias or user@host[:port]"),
       command: z.string().describe("Shell command to run on the Host"),
       cwd: z.string().optional().describe("Remote working directory"),
       timeoutSec: z.number().int().min(1).max(900).optional().describe("Timeout in seconds (default 120, max 900)"),
-      sudo: z.boolean().optional().describe("Run the command as root via sudo; the user is asked for the sudo password if the Host needs one")
+      sudo: z.boolean().optional().describe("Run the command as root via sudo; the user is asked for the sudo password if the Host needs one"),
+      async: z.boolean().optional().describe("Run in the background: returns a job id at once and the result arrives as a follow-up. Long commands are backgrounded automatically. Monitor with read proc://<id>, block with wait, cancel by writing proc://<id>/kill.")
     }),
     loadMode: "essential",
     approval: "read",
@@ -20918,70 +20950,116 @@ function registerExecTool(pi, rt) {
           approvedBy = decision;
         }
       }
-      try {
-        const details = await runCommand(rt, ctx, spec, params.command, {
-          cwd: params.cwd,
-          timeoutSec: params.timeoutSec,
-          signal,
-          approvedBy,
-          sudoPassword: params.sudo ? async () => {
-            const cached = rt.sudoPasswords.get(spec.id);
-            if (cached !== undefined)
-              return cached;
-            const answer = await openSecret(ctx, `sudo password for ${spec.user}@${spec.hostName}`, true);
-            if (answer?.remember)
-              rt.sudoPasswords.set(spec.id, answer.value);
-            return answer?.value;
-          } : undefined,
-          onPartial: (partial) => onUpdate?.({ content: [{ type: "text", text: formatExecText(partial) }], details: partial })
-        });
-        if (details.signal === "SUDO_DENIED") {
-          rt.sudoPasswords.delete(spec.id);
-          return errorResult(`sudo rejected the password on ${spec.id}; the command did not run.`);
+      const run = async (jobSignal, onPartial) => {
+        try {
+          const details = await runCommand(rt, ctx, spec, params.command, {
+            cwd: params.cwd,
+            timeoutSec: params.timeoutSec,
+            signal: jobSignal,
+            approvedBy,
+            sudoPassword: params.sudo ? async () => {
+              const cached = rt.sudoPasswords.get(spec.id);
+              if (cached !== undefined)
+                return cached;
+              const answer = await openSecret(ctx, `sudo password for ${spec.user}@${spec.hostName}`, true);
+              if (answer?.remember)
+                rt.sudoPasswords.set(spec.id, answer.value);
+              return answer?.value;
+            } : undefined,
+            onPartial
+          });
+          if (details.signal === "SUDO_DENIED") {
+            rt.sudoPasswords.delete(spec.id);
+            return errorResult(`sudo rejected the password on ${spec.id}; the command did not run.`);
+          }
+          if (details.signal === "SUDO_CANCELLED") {
+            return errorResult(`User cancelled the sudo password prompt on ${spec.id}.`);
+          }
+          return { content: [{ type: "text", text: formatExecText(details) }], details };
+        } catch (e) {
+          return errorResult(`SSH to ${spec.id} failed: ${e instanceof Error ? e.message : String(e)}`);
         }
-        if (details.signal === "SUDO_CANCELLED") {
-          return errorResult(`User cancelled the sudo password prompt on ${spec.id}.`);
+      };
+      const toUpdate = (d) => ({ content: [{ type: "text", text: formatExecText(d) }], details: d });
+      const empty = shape({ hostId: spec.id, command: params.command, cwd: params.cwd, approvedBy }, { code: null, timedOut: false, stdout: "", stderr: "", durationMs: 0 });
+      const startJob = (mgr, foreground) => {
+        let backgrounded = !foreground;
+        let latest;
+        const done = Promise.withResolvers();
+        const label = jobs.formatAsyncJobLabel(`${spec.id}: ${params.command}`);
+        const jobId = mgr.register("ssh", label, async ({ jobId, signal: jobSignal, reportProgress }) => {
+          const emit = (d, state) => {
+            latest = d;
+            const text = formatExecText(d);
+            reportProgress(text, { output: text });
+            onUpdate?.(toUpdate(backgrounded ? { ...d, async: { state, jobId, type: "ssh" } } : d));
+          };
+          const result = await run(jobSignal, (d) => emit(d, "running"));
+          done.resolve(result);
+          const d = result.details;
+          const text = result.content[0].text;
+          const failed = !("hostId" in d) || d.exitCode !== 0 || d.timedOut || d.signal !== undefined;
+          if ("hostId" in d)
+            emit(d, jobSignal.aborted ? "cancelled" : failed ? "failed" : "completed");
+          if (failed)
+            throw new Error(text);
+          return text;
+        }, { ownerId: ctx.agent?.id, foreground });
+        return {
+          jobId,
+          completion: done.promise,
+          latest: () => latest,
+          background: () => {
+            backgrounded = true;
+          }
+        };
+      };
+      const notice = (jobId) => `Backgrounded as job ${jobId} (killed once it has run ${params.timeoutSec ?? DEFAULT_TIMEOUT_SEC}s in total); its result arrives as a follow-up the moment it finishes. Do NOT poll: read proc://${jobId} for progress, call wait to block on it, or write proc://${jobId}/kill to cancel.`;
+      const backgroundResult = (jobId, d) => ({
+        content: [{ type: "text", text: d.stdout || d.stderr ? `${formatExecText(d)}
+
+${notice(jobId)}` : notice(jobId) }],
+        details: { ...d, async: { state: "running", jobId, type: "ssh" } }
+      });
+      const mgr = jobs?.AsyncJobManager.instance();
+      if (params.async) {
+        if (!mgr)
+          return errorResult("Background jobs are unavailable in this omp build.");
+        if (setting("async.enabled") === false)
+          return errorResult("Async execution is disabled. Enable async.enabled to use async mode.");
+        if (mgr.atCapacity)
+          return errorResult("Background job limit reached. Wait for running jobs to finish or cancel one.");
+        try {
+          await rt.pool.get(spec, rt.prompter(ctx));
+        } catch (e) {
+          return errorResult(`SSH to ${spec.id} failed: ${e instanceof Error ? e.message : String(e)}`);
         }
-        return { content: [{ type: "text", text: formatExecText(details) }], details };
-      } catch (e) {
-        return errorResult(`SSH to ${spec.id} failed: ${e instanceof Error ? e.message : String(e)}`);
+        const job = startJob(mgr, false);
+        return backgroundResult(job.jobId, empty);
       }
-    },
-    describeCall(args) {
-      return {
-        tool: {
-          title: "SSH",
-          target: args.command,
-          targetKind: "command",
-          badges: [{ text: args.host, tone: "accent" }, ...args.sudo ? [{ text: "sudo", tone: "warning" }] : []]
+      if (mgr && !mgr.atCapacity && setting("bash.autoBackground.enabled") !== false) {
+        const timeoutMs = (params.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
+        const waitMs = jobs.resolveAutoBackgroundWaitMs(Math.floor(setting("bash.autoBackground.thresholdMs") ?? 60000), timeoutMs);
+        const job = startJob(mgr, waitMs > 0);
+        if (waitMs === 0)
+          return backgroundResult(job.jobId, empty);
+        const r = await jobs.raceJobSettlement(job.completion.then((result) => ({ kind: "completed", result })), waitMs, signal);
+        if (r.kind === "completed") {
+          mgr.releaseForegroundJob(job.jobId);
+          return r.result;
         }
-      };
+        if (r.kind === "aborted") {
+          mgr.cancel(job.jobId);
+          mgr.releaseForegroundJob(job.jobId);
+          return errorResult(`Remote command on ${spec.id} aborted.`);
+        }
+        job.background();
+        mgr.backgroundJob(job.jobId);
+        return backgroundResult(job.jobId, job.latest() ?? empty);
+      }
+      return run(signal, (d) => onUpdate?.(toUpdate(d)));
     },
-    describeResult(result, _opts, args) {
-      const d = result.details;
-      if (!d || !("hostId" in d))
-        return;
-      const failed = d.exitCode !== 0 || d.timedOut;
-      return {
-        tool: {
-          title: "SSH",
-          target: d.command,
-          targetKind: "command",
-          meta: [d.hostId, `exit ${exitLabel(d)}`, `${(d.durationMs / 1000).toFixed(1)}s`],
-          badges: [
-            { text: d.approvedBy, tone: d.approvedBy === "allowlist" ? "success" : "warning" },
-            ...args.sudo ? [{ text: "sudo", tone: "warning" }] : []
-          ],
-          exit: d.exitCode === 0 ? undefined : d.exitCode,
-          note: d.timedOut ? "timed out" : d.truncated ? "truncated" : undefined
-        },
-        open: failed,
-        body: [
-          ...d.stdout ? [n("ansi", { text: d.stdout })] : [],
-          ...d.stderr ? [n("section", { head: "stderr" }, [n("ansi", { text: d.stderr })], "stderr")] : []
-        ]
-      };
-    }
+    ...shell && { describeCall: shell.describeCall, describeResult: card, mergeCallAndResult: true, inline: true }
   });
 }
 
@@ -22412,12 +22490,12 @@ async function openPane(ctx, model, opts) {
 
 // src/index.ts
 var message2 = (e) => e instanceof Error ? e.message : String(e);
-function piSsh(pi) {
+async function piSsh(pi) {
   const rt = createRuntime();
   const adhoc = new Map;
   const lastRuns = new Map;
   registerHostsTool(pi, rt);
-  registerExecTool(pi, rt);
+  await registerExecTool(pi, rt);
   registerTransferTool(pi, rt);
   const completions = (prefix, extra = []) => {
     const items = [...extra, ...rt.configHosts()].filter((h) => h.startsWith(prefix));

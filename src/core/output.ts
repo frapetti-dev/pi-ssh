@@ -10,6 +10,7 @@ export interface ExecDetails {
 	stderr: string;
 	truncated: boolean;
 	approvedBy: "allowlist" | "once" | "host-grant" | "user";
+	async?: { state: "running" | "completed" | "failed" | "cancelled"; jobId: string; type: "ssh" };
 }
 
 const MAX_LINES = 400;

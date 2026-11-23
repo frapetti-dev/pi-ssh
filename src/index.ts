@@ -10,7 +10,7 @@ import { openPane } from "./ui/pane";
 
 const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-export default function piSsh(pi: ExtensionAPI): void {
+export default async function piSsh(pi: ExtensionAPI): Promise<void> {
 	const rt = createRuntime();
 	/** Ad-hoc Hosts added in the manager (or by `/ssh-manager user@host`); kept for this omp session. */
 	const adhoc = new Map<string, HostSpec>();
@@ -18,7 +18,7 @@ export default function piSsh(pi: ExtensionAPI): void {
 	const lastRuns = new Map<string, ExecDetails>();
 
 	registerHostsTool(pi, rt);
-	registerExecTool(pi, rt);
+	await registerExecTool(pi, rt);
 	registerTransferTool(pi, rt);
 
 	const completions = (prefix: string, extra: string[] = []) => {

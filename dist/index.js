@@ -4736,7 +4736,7 @@ var require_utils = __commonJS(function(exports, module) {
 
 // node_modules/ssh2/lib/protocol/crypto/poly1305.js
 var require_poly1305 = __commonJS(function(exports, module) {
-  var __dirname = "C:\\Users\\f.rapetti\\git\\pi-ssh\\node_modules\\ssh2\\lib\\protocol\\crypto", __filename = "C:\\Users\\f.rapetti\\git\\pi-ssh\\node_modules\\ssh2\\lib\\protocol\\crypto\\poly1305.js";
+  var __dirname = "C:\\Git\\personal\\pi-ssh\\node_modules\\ssh2\\lib\\protocol\\crypto", __filename = "C:\\Git\\personal\\pi-ssh\\node_modules\\ssh2\\lib\\protocol\\crypto\\poly1305.js";
   var createPoly1305 = function() {
     var _scriptDir = typeof document !== "undefined" && document.currentScript ? document.currentScript.src : undefined;
     if (typeof __filename !== "undefined")
@@ -7509,7 +7509,7 @@ ${formatted}-----END ${type} KEY-----`;
 
 // node_modules/ssh2/lib/agent.js
 var require_agent = __commonJS(function(exports, module) {
-  var __dirname = "C:\\Users\\f.rapetti\\git\\pi-ssh\\node_modules\\ssh2\\lib";
+  var __dirname = "C:\\Git\\personal\\pi-ssh\\node_modules\\ssh2\\lib";
   var { Socket } = __require("net");
   var { Duplex } = __require("stream");
   var { resolve } = __require("path");
@@ -18820,7 +18820,7 @@ var require_lib2 = __commonJS(function(exports, module) {
 });
 
 // src/pane-model.ts
-import * as fs5 from "fs";
+import * as fs6 from "fs";
 import * as os3 from "os";
 import * as path6 from "path";
 
@@ -20117,6 +20117,325 @@ async function runTransfer(conn, plan, onProgress, signal) {
   return { filesDone, bytes, skipped: plan.skipped };
 }
 
+// src/core/connections.ts
+var import_ssh2 = __toESM(require_lib2(), 1);
+import * as fs5 from "fs/promises";
+import { StringDecoder } from "string_decoder";
+var SUDO_PROMPT = "[pi-ssh:sudo-password]";
+var MAX_STREAM_CHARS = 32 * 1024 * 1024;
+var PASSWORD_TRIES = 3;
+function createExec(client) {
+  return (cmd, opts) => {
+    const { promise, resolve, reject } = Promise.withResolvers();
+    const start = Date.now();
+    client.exec(cmd, (err, stream) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      let stdout = "";
+      let stderr = "";
+      let code = null;
+      let exitSignal;
+      let settled = false;
+      let sudoPrompts = 0;
+      let scanFrom = 0;
+      const finish = (extra) => {
+        if (settled)
+          return;
+        settled = true;
+        clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", onAbort);
+        resolve({
+          code: extra.timedOut || extra.signal ? null : code,
+          signal: extra.signal ?? exitSignal,
+          timedOut: extra.timedOut ?? false,
+          stdout,
+          stderr: opts.sudoPassword ? stderr.replaceAll(SUDO_PROMPT, "") : stderr,
+          durationMs: Date.now() - start
+        });
+      };
+      const kill = (extra) => {
+        if (settled)
+          return;
+        try {
+          stream.signal("KILL");
+          stream.close();
+        } catch {}
+        finish(extra);
+      };
+      const onAbort = () => kill({ signal: "ABORTED" });
+      const timer = setTimeout(() => kill({ timedOut: true }), opts.timeoutMs);
+      const answerSudo = async () => {
+        if (++sudoPrompts > 1)
+          return kill({ signal: "SUDO_DENIED" });
+        const password = await opts.sudoPassword();
+        if (settled)
+          return;
+        if (password === undefined)
+          return kill({ signal: "SUDO_CANCELLED" });
+        stream.write(`${password}
+`);
+      };
+      if (opts.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+      const collect = (which) => {
+        const decoder = new StringDecoder("utf8");
+        return (data) => {
+          if (settled)
+            return;
+          let chunk = decoder.write(data);
+          if (which === "stdout")
+            stdout += chunk;
+          else {
+            stderr += chunk;
+            if (opts.sudoPassword) {
+              let i;
+              while ((i = stderr.indexOf(SUDO_PROMPT, scanFrom)) >= 0) {
+                scanFrom = i + SUDO_PROMPT.length;
+                answerSudo().catch(() => kill({ signal: "SUDO_CANCELLED" }));
+              }
+              scanFrom = Math.max(scanFrom, stderr.length - SUDO_PROMPT.length + 1);
+              chunk = chunk.replaceAll(SUDO_PROMPT, "");
+            }
+          }
+          opts.onData?.(which, chunk);
+          if (stdout.length > MAX_STREAM_CHARS || stderr.length > MAX_STREAM_CHARS) {
+            kill({ signal: "OUTPUT_LIMIT" });
+          }
+        };
+      };
+      stream.on("data", collect("stdout"));
+      stream.stderr.on("data", collect("stderr"));
+      stream.on("exit", (c, s) => {
+        code = c ?? null;
+        exitSignal = s || undefined;
+      });
+      stream.on("close", () => finish({}));
+    });
+    return promise;
+  };
+}
+
+class ConnectionPool {
+  opts;
+  conns = new Map;
+  pending = new Map;
+  listeners = new Set;
+  constructor(opts) {
+    this.opts = opts;
+  }
+  onChange(cb) {
+    this.listeners.add(cb);
+    return () => this.listeners.delete(cb);
+  }
+  list() {
+    return [...this.conns.values()];
+  }
+  close(id) {
+    const conn = this.conns.get(id);
+    conn?.close();
+    return conn !== undefined;
+  }
+  closeAll() {
+    for (const conn of this.conns.values())
+      conn.close();
+  }
+  get(spec, prompter) {
+    const live = this.conns.get(spec.id);
+    if (live)
+      return Promise.resolve(live);
+    const inflight = this.pending.get(spec.id);
+    if (inflight)
+      return inflight;
+    const p = this.connect(spec, prompter).finally(() => {
+      this.pending.delete(spec.id);
+      this.notify();
+    });
+    this.pending.set(spec.id, p);
+    this.notify();
+    return p;
+  }
+  connecting() {
+    return [...this.pending.keys()];
+  }
+  notify() {
+    for (const cb of this.listeners)
+      cb();
+  }
+  async connect(spec, prompter) {
+    let sock;
+    let verifiedKey;
+    let jump;
+    if (spec.proxyJump) {
+      jump = await this.get(this.opts.resolveHost(spec.proxyJump), prompter);
+      const via = jump.client;
+      const forwarded = Promise.withResolvers();
+      via.forwardOut("127.0.0.1", 0, spec.hostName, spec.port, (err, stream) => err ? forwarded.reject(err) : forwarded.resolve(stream));
+      sock = await forwarded.promise;
+    }
+    const client = new import_ssh2.Client;
+    let failure;
+    const tried = [];
+    let methodsLeft = null;
+    const hostVerifier = (key, verify) => {
+      (async () => {
+        const field = hostField(spec.hostName, spec.port);
+        const { fingerprint, type } = keyInfo(key);
+        let text = "";
+        try {
+          text = await fs5.readFile(this.opts.knownHostsPath, "utf8");
+        } catch {}
+        const { status, knownTypes } = checkHostKey(text, spec.hostName, spec.port, key);
+        if (status === "match") {
+          verifiedKey = { type, fingerprint };
+          return verify(true);
+        }
+        if (status === "mismatch") {
+          failure = `Host key for ${field} changed (fingerprint ${fingerprint}). Refusing to connect; fix ~/.ssh/known_hosts manually.`;
+          return verify(false);
+        }
+        if (status === "revoked") {
+          failure = `Host key for ${field} is revoked (fingerprint ${fingerprint}). Refusing to connect.`;
+          return verify(false);
+        }
+        if (!await prompter.confirmHostKey({ host: spec, type, fingerprint, knownTypes })) {
+          failure = "Host key not trusted by user.";
+          return verify(false);
+        }
+        try {
+          await appendKnownHost(this.opts.knownHostsPath, spec.hostName, spec.port, key);
+        } catch (e) {
+          failure = `Could not save host key: ${e instanceof Error ? e.message : String(e)}`;
+          return verify(false);
+        }
+        verifiedKey = { type, fingerprint };
+        verify(true);
+      })();
+    };
+    const candidates = this.authCandidates(spec, prompter, tried, () => methodsLeft);
+    const authHandler = (left, _partial, next) => {
+      methodsLeft = left;
+      candidates.next().then((r) => next(r.done ? false : r.value), () => next(false));
+    };
+    const ready = Promise.withResolvers();
+    client.once("ready", ready.resolve);
+    client.on("error", (err) => {
+      if (failure)
+        ready.reject(new Error(failure));
+      else if (err.level === "client-authentication") {
+        ready.reject(new Error(`Authentication failed for ${spec.id} (tried: ${tried.join(", ") || "none"})`));
+      } else
+        ready.reject(err);
+    });
+    client.once("close", () => ready.reject(new Error(failure ?? `Connection to ${spec.id} closed before it was ready`)));
+    client.connect({
+      host: spec.hostName,
+      port: spec.port,
+      username: spec.user,
+      sock,
+      hostVerifier,
+      authHandler,
+      keepaliveInterval: 15000,
+      readyTimeout: this.opts.readyTimeoutMs ?? 20000,
+      algorithms: this.opts.algorithms
+    });
+    await ready.promise;
+    let sftpPromise;
+    const conn = {
+      spec,
+      client,
+      connectedAt: Date.now(),
+      hostKey: verifiedKey ?? { type: "unknown", fingerprint: "unknown" },
+      sftp() {
+        if (!sftpPromise) {
+          const { promise, resolve, reject } = Promise.withResolvers();
+          client.sftp((err, s) => err ? reject(err) : resolve(s));
+          promise.catch(() => {
+            sftpPromise = undefined;
+          });
+          sftpPromise = promise;
+        }
+        return sftpPromise;
+      },
+      exec: createExec(client),
+      close: () => client.end()
+    };
+    this.conns.set(spec.id, conn);
+    client.on("close", () => {
+      if (this.conns.get(spec.id) === conn)
+        this.conns.delete(spec.id);
+      this.notify();
+    });
+    jump?.client.once("close", () => client.end());
+    this.notify();
+    return conn;
+  }
+  async* authCandidates(spec, prompter, tried, left) {
+    const username = spec.user;
+    const offered = (m) => left()?.includes(m) ?? true;
+    if (this.opts.agentPath) {
+      tried.push("agent");
+      yield { type: "agent", username, agent: this.opts.agentPath };
+    }
+    for (const file of spec.identityFiles) {
+      if (!offered("publickey"))
+        break;
+      let buf;
+      try {
+        buf = await fs5.readFile(file);
+      } catch {
+        continue;
+      }
+      let key = import_ssh2.utils.parseKey(buf);
+      let passphrase;
+      if (key instanceof Error && /passphrase/i.test(key.message)) {
+        for (let attempt = 0;attempt < 3; attempt++) {
+          passphrase = await prompter.askSecret(`Passphrase for ${file}`);
+          if (passphrase === undefined)
+            break;
+          key = import_ssh2.utils.parseKey(buf, passphrase);
+          if (!(key instanceof Error))
+            break;
+        }
+      }
+      if (key instanceof Error)
+        continue;
+      tried.push(`publickey:${file}`);
+      yield { type: "publickey", username, key: Array.isArray(key) ? key[0] : key, passphrase };
+    }
+    if (offered("keyboard-interactive")) {
+      tried.push("keyboard-interactive");
+      yield {
+        type: "keyboard-interactive",
+        username,
+        prompt: async (_name, _instr, _lang, prompts, finish) => {
+          const answers = [];
+          for (const p of prompts) {
+            const a = await prompter.askSecret(p.prompt);
+            if (a === undefined)
+              return finish([]);
+            answers.push(a);
+          }
+          finish(answers);
+        }
+      };
+    }
+    if (offered("password")) {
+      tried.push("password");
+      for (let attempt = 0;attempt < PASSWORD_TRIES; attempt++) {
+        const password = await prompter.askSecret(`Password for ${spec.user}@${spec.hostName}`);
+        if (password === undefined)
+          return;
+        yield { type: "password", username, password };
+      }
+    }
+  }
+}
+
 // src/core/output.ts
 var MAX_LINES = 400;
 var KEEP_LINES = 200;
@@ -20312,19 +20631,28 @@ function buildApprovalComponent(_tui, done, req) {
   const buttons = [
     { label: "Allow once", act: "once", key: "y", value: "once" }
   ];
-  if (req.kind === "command")
+  if (req.kind === "command" && !req.sudo) {
     buttons.push({ label: "Always on this host", act: "host", key: "a", value: "host" });
+  }
   buttons.push(null, { label: "Deny", act: "deny", key: "escape", value: "deny" });
   if (req.kind === "command") {
     const kv = [{ k: "host", v: target(req.host) }];
+    if (req.sudo)
+      kv.push({ k: "as", v: "root (sudo)" });
     if (req.cwd)
       kv.push({ k: "cwd", v: req.cwd });
     return buildDialog({
       head: "SSH approval",
-      title: `Run command on ${req.host.id}?`,
+      title: req.sudo ? `Run command as root on ${req.host.id}?` : `Run command on ${req.host.id}?`,
       body: [n("kv", { items: kv }), n("code", { text: req.command, lang: "bash" }), prose(req.reason)],
       buttons,
-      ansi: [`host: ${target(req.host)}`, ...req.cwd ? [`cwd: ${req.cwd}`] : [], `$ ${req.command}`, req.reason],
+      ansi: [
+        `host: ${target(req.host)}`,
+        ...req.sudo ? ["as: root (sudo)"] : [],
+        ...req.cwd ? [`cwd: ${req.cwd}`] : [],
+        `$ ${req.command}`,
+        req.reason
+      ],
       aliases: { n: "deny" }
     }, done);
   }
@@ -20349,6 +20677,146 @@ function buildApprovalComponent(_tui, done, req) {
 async function openApproval(ctx, req) {
   const result = await withDialog(() => ctx.ui.custom((tui, _theme, _kb, done) => buildApprovalComponent(tui, done, req), OVERLAY_OPTIONS));
   return result ?? "deny";
+}
+
+// src/ui/line-input.ts
+var PASTE_START = "\x1B[200~";
+var PASTE_END = "\x1B[201~";
+var PRINTABLE = /^[^\x00-\x1f\x7f]+$/;
+
+class LineInput {
+  opts;
+  value;
+  cursor;
+  constructor(initial = "", opts = {}) {
+    this.opts = opts;
+    this.value = initial;
+    this.cursor = initial.length;
+  }
+  handleInput(data) {
+    const text = data.startsWith(PASTE_START) ? data.slice(PASTE_START.length).replace(PASTE_END, "") : data;
+    const flat = text.replace(/[\r\n]/g, "");
+    if (flat && PRINTABLE.test(flat)) {
+      this.value = this.value.slice(0, this.cursor) + flat + this.value.slice(this.cursor);
+      this.cursor += flat.length;
+      return true;
+    }
+    if (isKey(data, "backspace")) {
+      if (this.cursor > 0) {
+        this.value = this.value.slice(0, this.cursor - 1) + this.value.slice(this.cursor);
+        this.cursor--;
+      }
+      return true;
+    }
+    if (isKey(data, "delete")) {
+      this.value = this.value.slice(0, this.cursor) + this.value.slice(this.cursor + 1);
+      return true;
+    }
+    if (isKey(data, "left")) {
+      this.cursor = Math.max(0, this.cursor - 1);
+      return true;
+    }
+    if (isKey(data, "right")) {
+      this.cursor = Math.min(this.value.length, this.cursor + 1);
+      return true;
+    }
+    if (isKey(data, "home")) {
+      this.cursor = 0;
+      return true;
+    }
+    if (isKey(data, "end")) {
+      this.cursor = this.value.length;
+      return true;
+    }
+    if (isKey(data, "ctrl+u")) {
+      this.value = "";
+      this.cursor = 0;
+      return true;
+    }
+    return false;
+  }
+  display() {
+    return this.opts.masked ? "\u2022".repeat(this.value.length) : this.value;
+  }
+  node(p) {
+    return n("input", { text: this.display(), cursor: p.focused ? this.cursor : undefined, placeholder: p.placeholder, readonly: !p.focused }, undefined, p.key);
+  }
+}
+
+// src/ui/secret.ts
+function buildSecretComponent(tui, done, title, offerRemember = false) {
+  const input = new LineInput("", { masked: true });
+  const memo = new Memo;
+  let version = 0;
+  let finished = false;
+  let remember = false;
+  const finish = (answer) => {
+    if (finished)
+      return;
+    finished = true;
+    done(answer);
+  };
+  const answer = () => ({ value: input.value, remember });
+  const toggle = () => {
+    remember = !remember;
+    version++;
+    tui.requestRender();
+  };
+  return {
+    nativeOverlay: { role: "omp.overlay.pi-ssh", head: "SSH" },
+    describe(cx) {
+      return memo.get([cx.dark, version], () => framed([
+        heading(title),
+        input.node({ key: "secret", focused: true }),
+        ...offerRemember ? [
+          n("row", { gap: "sm", align: "center" }, [
+            txt("Remember for this omp session"),
+            n("badge", {
+              text: remember ? "on" : "off",
+              tone: remember ? "success" : "muted",
+              actions: { click: "remember" }
+            }),
+            n("kbd", { keys: ["tab"] })
+          ], "remember")
+        ] : [],
+        bar([button("OK", "ok", "enter"), null, button("Cancel", "cancel", "escape")])
+      ], "md"));
+    },
+    handleNativeEvent(e) {
+      if (e.type !== "action")
+        return;
+      if (e.act === "ok")
+        finish(answer());
+      else if (e.act === "cancel")
+        finish(undefined);
+      else if (e.act === "remember" && offerRemember)
+        toggle();
+    },
+    handleInput(data) {
+      if (isKey(data, "enter"))
+        return finish(answer());
+      if (isKey(data, "escape"))
+        return finish(undefined);
+      if (offerRemember && isKey(data, "tab"))
+        return toggle();
+      if (input.handleInput(data)) {
+        version++;
+        tui.requestRender();
+      }
+    },
+    render(width) {
+      return [
+        title,
+        input.display(),
+        ...offerRemember ? [`[${remember ? "x" : " "}] remember for this omp session  [tab] toggle`] : [],
+        "[enter] ok  [esc] cancel"
+      ].map((l) => fit(l, width));
+    },
+    invalidate() {}
+  };
+}
+function openSecret(ctx, title, offerRemember = false) {
+  return withDialog(() => ctx.ui.custom((tui, _theme, _kb, done) => buildSecretComponent(tui, done, title, offerRemember), OVERLAY_OPTIONS));
 }
 
 // src/tools/exec.ts
@@ -20379,9 +20847,12 @@ async function runCommand(rt, ctx, spec, command, opts) {
   let stderr = "";
   let lastUpdate = 0;
   const started = Date.now();
-  const result = await conn.exec(opts.cwd ? `cd -- ${shQuote(opts.cwd)} && ${command}` : command, {
+  const inner = opts.cwd ? `cd -- ${shQuote(opts.cwd)} && ${command}` : command;
+  const remote = opts.sudoPassword ? `sudo -S -p ${shQuote(SUDO_PROMPT)} -- sh -c ${shQuote(inner)}` : inner;
+  const result = await conn.exec(remote, {
     signal: opts.signal,
     timeoutMs: (opts.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000,
+    sudoPassword: opts.sudoPassword,
     onData: (which, chunk) => {
       if (which === "stdout")
         stdout += chunk;
@@ -20402,12 +20873,13 @@ function registerExecTool(pi, rt) {
   pi.registerTool({
     name: "ssh_exec",
     label: "SSH exec",
-    description: "Run one non-interactive command on a remote Host over SSH and return exit status, stdout and stderr. " + "Read-only allowlisted commands (ls, cat, grep, git status, ...) run immediately; any other command, " + "pipelines with redirects or command substitution included, needs the user's approval first. " + "There is no interactive shell, no PTY and no stdin. Output is truncated to the first and last 200 lines.",
+    description: "Run one non-interactive command on a remote Host over SSH and return exit status, stdout and stderr. " + "Read-only allowlisted commands (ls, cat, grep, git status, ...) run immediately; any other command, " + "pipelines with redirects or command substitution included, needs the user's approval first. " + "There is no interactive shell, no PTY and no stdin. Output is truncated to the first and last 200 lines. " + "Set sudo: true to run as root; never prefix the command with sudo yourself (there is no TTY for its password prompt). Every sudo command needs the user's approval.",
     parameters: z.object({
       host: z.string().describe("~/.ssh/config alias or user@host[:port]"),
       command: z.string().describe("Shell command to run on the Host"),
       cwd: z.string().optional().describe("Remote working directory"),
-      timeoutSec: z.number().int().min(1).max(900).optional().describe("Timeout in seconds (default 120, max 900)")
+      timeoutSec: z.number().int().min(1).max(900).optional().describe("Timeout in seconds (default 120, max 900)"),
+      sudo: z.boolean().optional().describe("Run the command as root via sudo; the user is asked for the sudo password if the Host needs one")
     }),
     loadMode: "essential",
     approval: "read",
@@ -20423,10 +20895,10 @@ function registerExecTool(pi, rt) {
       if (rules.warning && rules.warning !== lastWarning && ctx.hasUI)
         ctx.ui.notify(rules.warning, "warning");
       lastWarning = rules.warning;
-      const verdict = classify(params.command, rules);
+      const verdict = params.sudo ? { allowed: false, reason: "runs as root via sudo" } : classify(params.command, rules);
       let approvedBy = "allowlist";
       if (!verdict.allowed) {
-        if (rt.grants.has(spec.id))
+        if (rt.grants.has(spec.id) && !params.sudo)
           approvedBy = "host-grant";
         else if (!ctx.hasUI) {
           return errorResult(`Remote command needs user approval but no UI is available: ${verdict.reason}`);
@@ -20436,6 +20908,7 @@ function registerExecTool(pi, rt) {
             host: spec,
             command: params.command,
             cwd: params.cwd,
+            sudo: params.sudo,
             reason: verdict.reason
           });
           if (decision === "deny")
@@ -20451,8 +20924,24 @@ function registerExecTool(pi, rt) {
           timeoutSec: params.timeoutSec,
           signal,
           approvedBy,
+          sudoPassword: params.sudo ? async () => {
+            const cached = rt.sudoPasswords.get(spec.id);
+            if (cached !== undefined)
+              return cached;
+            const answer = await openSecret(ctx, `sudo password for ${spec.user}@${spec.hostName}`, true);
+            if (answer?.remember)
+              rt.sudoPasswords.set(spec.id, answer.value);
+            return answer?.value;
+          } : undefined,
           onPartial: (partial) => onUpdate?.({ content: [{ type: "text", text: formatExecText(partial) }], details: partial })
         });
+        if (details.signal === "SUDO_DENIED") {
+          rt.sudoPasswords.delete(spec.id);
+          return errorResult(`sudo rejected the password on ${spec.id}; the command did not run.`);
+        }
+        if (details.signal === "SUDO_CANCELLED") {
+          return errorResult(`User cancelled the sudo password prompt on ${spec.id}.`);
+        }
         return { content: [{ type: "text", text: formatExecText(details) }], details };
       } catch (e) {
         return errorResult(`SSH to ${spec.id} failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -20464,7 +20953,7 @@ function registerExecTool(pi, rt) {
           title: "SSH",
           target: args.command,
           targetKind: "command",
-          badges: [{ text: args.host, tone: "accent" }]
+          badges: [{ text: args.host, tone: "accent" }, ...args.sudo ? [{ text: "sudo", tone: "warning" }] : []]
         }
       };
     },
@@ -20479,7 +20968,10 @@ function registerExecTool(pi, rt) {
           target: d.command,
           targetKind: "command",
           meta: [d.hostId, `exit ${exitLabel(d)}`, `${(d.durationMs / 1000).toFixed(1)}s`],
-          badges: [{ text: d.approvedBy, tone: d.approvedBy === "allowlist" ? "success" : "warning" }],
+          badges: [
+            { text: d.approvedBy, tone: d.approvedBy === "allowlist" ? "success" : "warning" },
+            ...args.sudo ? [{ text: "sudo", tone: "warning" }] : []
+          ],
           exit: d.exitCode === 0 ? undefined : d.exitCode,
           note: d.timedOut ? "timed out" : d.truncated ? "truncated" : undefined
         },
@@ -20731,7 +21223,7 @@ function createPaneModel(rt, pi, ctx, session) {
       const spec = specFor(id);
       let text;
       try {
-        text = await fs5.promises.readFile(rt.knownHostsPath, "utf8");
+        text = await fs6.promises.readFile(rt.knownHostsPath, "utf8");
       } catch (e) {
         if (e.code === "ENOENT")
           return [];
@@ -20744,7 +21236,7 @@ function createPaneModel(rt, pi, ctx, session) {
       const rows = (list, builtin) => list.map((rule) => ({ rule, builtin: builtin.includes(rule) }));
       return {
         path: rt.rulesPath,
-        exists: fs5.existsSync(rt.rulesPath),
+        exists: fs6.existsSync(rt.rulesPath),
         warning: loaded.warning,
         allow: rows(loaded.allow, BUILTIN_ALLOW),
         deny: rows(loaded.deny, BUILTIN_DENY)
@@ -20818,9 +21310,9 @@ function createPaneModel(rt, pi, ctx, session) {
     },
     canOpenRules: ternAvailable,
     async openRulesFile() {
-      if (!fs5.existsSync(rt.rulesPath)) {
-        await fs5.promises.mkdir(path6.dirname(rt.rulesPath), { recursive: true });
-        await fs5.promises.writeFile(rt.rulesPath, EMPTY_RULES);
+      if (!fs6.existsSync(rt.rulesPath)) {
+        await fs6.promises.mkdir(path6.dirname(rt.rulesPath), { recursive: true });
+        await fs6.promises.writeFile(rt.rulesPath, EMPTY_RULES);
       }
       await tern(pi, ctx, ["open", "--split", "right", rt.rulesPath]);
     }
@@ -20831,301 +21323,6 @@ function createPaneModel(rt, pi, ctx, session) {
 import * as fs7 from "fs";
 import * as os4 from "os";
 import * as path7 from "path";
-
-// src/core/connections.ts
-var import_ssh2 = __toESM(require_lib2(), 1);
-import * as fs6 from "fs/promises";
-import { StringDecoder } from "string_decoder";
-var MAX_STREAM_CHARS = 32 * 1024 * 1024;
-var PASSWORD_TRIES = 3;
-function createExec(client) {
-  return (cmd, opts) => {
-    const { promise, resolve, reject } = Promise.withResolvers();
-    const start = Date.now();
-    client.exec(cmd, (err, stream) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      let stdout = "";
-      let stderr = "";
-      let code = null;
-      let exitSignal;
-      let settled = false;
-      const finish = (extra) => {
-        if (settled)
-          return;
-        settled = true;
-        clearTimeout(timer);
-        opts.signal?.removeEventListener("abort", onAbort);
-        resolve({
-          code: extra.timedOut || extra.signal ? null : code,
-          signal: extra.signal ?? exitSignal,
-          timedOut: extra.timedOut ?? false,
-          stdout,
-          stderr,
-          durationMs: Date.now() - start
-        });
-      };
-      const kill = (extra) => {
-        if (settled)
-          return;
-        try {
-          stream.signal("KILL");
-          stream.close();
-        } catch {}
-        finish(extra);
-      };
-      const onAbort = () => kill({ signal: "ABORTED" });
-      const timer = setTimeout(() => kill({ timedOut: true }), opts.timeoutMs);
-      if (opts.signal?.aborted) {
-        onAbort();
-        return;
-      }
-      opts.signal?.addEventListener("abort", onAbort, { once: true });
-      const collect = (which) => {
-        const decoder = new StringDecoder("utf8");
-        return (data) => {
-          if (settled)
-            return;
-          const chunk = decoder.write(data);
-          if (which === "stdout")
-            stdout += chunk;
-          else
-            stderr += chunk;
-          opts.onData?.(which, chunk);
-          if (stdout.length > MAX_STREAM_CHARS || stderr.length > MAX_STREAM_CHARS) {
-            kill({ signal: "OUTPUT_LIMIT" });
-          }
-        };
-      };
-      stream.on("data", collect("stdout"));
-      stream.stderr.on("data", collect("stderr"));
-      stream.on("exit", (c, s) => {
-        code = c ?? null;
-        exitSignal = s || undefined;
-      });
-      stream.on("close", () => finish({}));
-    });
-    return promise;
-  };
-}
-
-class ConnectionPool {
-  opts;
-  conns = new Map;
-  pending = new Map;
-  listeners = new Set;
-  constructor(opts) {
-    this.opts = opts;
-  }
-  onChange(cb) {
-    this.listeners.add(cb);
-    return () => this.listeners.delete(cb);
-  }
-  list() {
-    return [...this.conns.values()];
-  }
-  close(id) {
-    const conn = this.conns.get(id);
-    conn?.close();
-    return conn !== undefined;
-  }
-  closeAll() {
-    for (const conn of this.conns.values())
-      conn.close();
-  }
-  get(spec, prompter) {
-    const live = this.conns.get(spec.id);
-    if (live)
-      return Promise.resolve(live);
-    const inflight = this.pending.get(spec.id);
-    if (inflight)
-      return inflight;
-    const p = this.connect(spec, prompter).finally(() => {
-      this.pending.delete(spec.id);
-      this.notify();
-    });
-    this.pending.set(spec.id, p);
-    this.notify();
-    return p;
-  }
-  connecting() {
-    return [...this.pending.keys()];
-  }
-  notify() {
-    for (const cb of this.listeners)
-      cb();
-  }
-  async connect(spec, prompter) {
-    let sock;
-    let verifiedKey;
-    let jump;
-    if (spec.proxyJump) {
-      jump = await this.get(this.opts.resolveHost(spec.proxyJump), prompter);
-      const via = jump.client;
-      const forwarded = Promise.withResolvers();
-      via.forwardOut("127.0.0.1", 0, spec.hostName, spec.port, (err, stream) => err ? forwarded.reject(err) : forwarded.resolve(stream));
-      sock = await forwarded.promise;
-    }
-    const client = new import_ssh2.Client;
-    let failure;
-    const tried = [];
-    let methodsLeft = null;
-    const hostVerifier = (key, verify) => {
-      (async () => {
-        const field = hostField(spec.hostName, spec.port);
-        const { fingerprint, type } = keyInfo(key);
-        let text = "";
-        try {
-          text = await fs6.readFile(this.opts.knownHostsPath, "utf8");
-        } catch {}
-        const { status, knownTypes } = checkHostKey(text, spec.hostName, spec.port, key);
-        if (status === "match") {
-          verifiedKey = { type, fingerprint };
-          return verify(true);
-        }
-        if (status === "mismatch") {
-          failure = `Host key for ${field} changed (fingerprint ${fingerprint}). Refusing to connect; fix ~/.ssh/known_hosts manually.`;
-          return verify(false);
-        }
-        if (status === "revoked") {
-          failure = `Host key for ${field} is revoked (fingerprint ${fingerprint}). Refusing to connect.`;
-          return verify(false);
-        }
-        if (!await prompter.confirmHostKey({ host: spec, type, fingerprint, knownTypes })) {
-          failure = "Host key not trusted by user.";
-          return verify(false);
-        }
-        try {
-          await appendKnownHost(this.opts.knownHostsPath, spec.hostName, spec.port, key);
-        } catch (e) {
-          failure = `Could not save host key: ${e instanceof Error ? e.message : String(e)}`;
-          return verify(false);
-        }
-        verifiedKey = { type, fingerprint };
-        verify(true);
-      })();
-    };
-    const candidates = this.authCandidates(spec, prompter, tried, () => methodsLeft);
-    const authHandler = (left, _partial, next) => {
-      methodsLeft = left;
-      candidates.next().then((r) => next(r.done ? false : r.value), () => next(false));
-    };
-    const ready = Promise.withResolvers();
-    client.once("ready", ready.resolve);
-    client.on("error", (err) => {
-      if (failure)
-        ready.reject(new Error(failure));
-      else if (err.level === "client-authentication") {
-        ready.reject(new Error(`Authentication failed for ${spec.id} (tried: ${tried.join(", ") || "none"})`));
-      } else
-        ready.reject(err);
-    });
-    client.once("close", () => ready.reject(new Error(failure ?? `Connection to ${spec.id} closed before it was ready`)));
-    client.connect({
-      host: spec.hostName,
-      port: spec.port,
-      username: spec.user,
-      sock,
-      hostVerifier,
-      authHandler,
-      keepaliveInterval: 15000,
-      readyTimeout: this.opts.readyTimeoutMs ?? 20000,
-      algorithms: this.opts.algorithms
-    });
-    await ready.promise;
-    let sftpPromise;
-    const conn = {
-      spec,
-      client,
-      connectedAt: Date.now(),
-      hostKey: verifiedKey ?? { type: "unknown", fingerprint: "unknown" },
-      sftp() {
-        if (!sftpPromise) {
-          const { promise, resolve, reject } = Promise.withResolvers();
-          client.sftp((err, s) => err ? reject(err) : resolve(s));
-          promise.catch(() => {
-            sftpPromise = undefined;
-          });
-          sftpPromise = promise;
-        }
-        return sftpPromise;
-      },
-      exec: createExec(client),
-      close: () => client.end()
-    };
-    this.conns.set(spec.id, conn);
-    client.on("close", () => {
-      if (this.conns.get(spec.id) === conn)
-        this.conns.delete(spec.id);
-      this.notify();
-    });
-    jump?.client.once("close", () => client.end());
-    this.notify();
-    return conn;
-  }
-  async* authCandidates(spec, prompter, tried, left) {
-    const username = spec.user;
-    const offered = (m) => left()?.includes(m) ?? true;
-    if (this.opts.agentPath) {
-      tried.push("agent");
-      yield { type: "agent", username, agent: this.opts.agentPath };
-    }
-    for (const file of spec.identityFiles) {
-      if (!offered("publickey"))
-        break;
-      let buf;
-      try {
-        buf = await fs6.readFile(file);
-      } catch {
-        continue;
-      }
-      let key = import_ssh2.utils.parseKey(buf);
-      let passphrase;
-      if (key instanceof Error && /passphrase/i.test(key.message)) {
-        for (let attempt = 0;attempt < 3; attempt++) {
-          passphrase = await prompter.askSecret(`Passphrase for ${file}`);
-          if (passphrase === undefined)
-            break;
-          key = import_ssh2.utils.parseKey(buf, passphrase);
-          if (!(key instanceof Error))
-            break;
-        }
-      }
-      if (key instanceof Error)
-        continue;
-      tried.push(`publickey:${file}`);
-      yield { type: "publickey", username, key: Array.isArray(key) ? key[0] : key, passphrase };
-    }
-    if (offered("keyboard-interactive")) {
-      tried.push("keyboard-interactive");
-      yield {
-        type: "keyboard-interactive",
-        username,
-        prompt: async (_name, _instr, _lang, prompts, finish) => {
-          const answers = [];
-          for (const p of prompts) {
-            const a = await prompter.askSecret(p.prompt);
-            if (a === undefined)
-              return finish([]);
-            answers.push(a);
-          }
-          finish(answers);
-        }
-      };
-    }
-    if (offered("password")) {
-      tried.push("password");
-      for (let attempt = 0;attempt < PASSWORD_TRIES; attempt++) {
-        const password = await prompter.askSecret(`Password for ${spec.user}@${spec.hostName}`);
-        if (password === undefined)
-          return;
-        yield { type: "password", username, password };
-      }
-    }
-  }
-}
 
 // src/core/progress.ts
 var RATE_WINDOW_MS = 200;
@@ -21218,119 +21415,6 @@ function buildHostKeyComponent(_tui, done, info) {
 async function openHostKey(ctx, info) {
   const result = await withDialog(() => ctx.ui.custom((tui, _theme, _kb, done) => buildHostKeyComponent(tui, done, info), OVERLAY_OPTIONS));
   return result === true;
-}
-
-// src/ui/line-input.ts
-var PASTE_START = "\x1B[200~";
-var PASTE_END = "\x1B[201~";
-var PRINTABLE = /^[^\x00-\x1f\x7f]+$/;
-
-class LineInput {
-  opts;
-  value;
-  cursor;
-  constructor(initial = "", opts = {}) {
-    this.opts = opts;
-    this.value = initial;
-    this.cursor = initial.length;
-  }
-  handleInput(data) {
-    const text = data.startsWith(PASTE_START) ? data.slice(PASTE_START.length).replace(PASTE_END, "") : data;
-    const flat = text.replace(/[\r\n]/g, "");
-    if (flat && PRINTABLE.test(flat)) {
-      this.value = this.value.slice(0, this.cursor) + flat + this.value.slice(this.cursor);
-      this.cursor += flat.length;
-      return true;
-    }
-    if (isKey(data, "backspace")) {
-      if (this.cursor > 0) {
-        this.value = this.value.slice(0, this.cursor - 1) + this.value.slice(this.cursor);
-        this.cursor--;
-      }
-      return true;
-    }
-    if (isKey(data, "delete")) {
-      this.value = this.value.slice(0, this.cursor) + this.value.slice(this.cursor + 1);
-      return true;
-    }
-    if (isKey(data, "left")) {
-      this.cursor = Math.max(0, this.cursor - 1);
-      return true;
-    }
-    if (isKey(data, "right")) {
-      this.cursor = Math.min(this.value.length, this.cursor + 1);
-      return true;
-    }
-    if (isKey(data, "home")) {
-      this.cursor = 0;
-      return true;
-    }
-    if (isKey(data, "end")) {
-      this.cursor = this.value.length;
-      return true;
-    }
-    if (isKey(data, "ctrl+u")) {
-      this.value = "";
-      this.cursor = 0;
-      return true;
-    }
-    return false;
-  }
-  display() {
-    return this.opts.masked ? "\u2022".repeat(this.value.length) : this.value;
-  }
-  node(p) {
-    return n("input", { text: this.display(), cursor: p.focused ? this.cursor : undefined, placeholder: p.placeholder, readonly: !p.focused }, undefined, p.key);
-  }
-}
-
-// src/ui/secret.ts
-function buildSecretComponent(tui, done, title) {
-  const input = new LineInput("", { masked: true });
-  const memo = new Memo;
-  let version = 0;
-  let finished = false;
-  const finish = (value) => {
-    if (finished)
-      return;
-    finished = true;
-    done(value);
-  };
-  return {
-    nativeOverlay: { role: "omp.overlay.pi-ssh", head: "SSH" },
-    describe(cx) {
-      return memo.get([cx.dark, version], () => framed([
-        heading(title),
-        input.node({ key: "secret", focused: true }),
-        bar([button("OK", "ok", "enter"), null, button("Cancel", "cancel", "escape")])
-      ], "md"));
-    },
-    handleNativeEvent(e) {
-      if (e.type !== "action")
-        return;
-      if (e.act === "ok")
-        finish(input.value);
-      else if (e.act === "cancel")
-        finish(undefined);
-    },
-    handleInput(data) {
-      if (isKey(data, "enter"))
-        return finish(input.value);
-      if (isKey(data, "escape"))
-        return finish(undefined);
-      if (input.handleInput(data)) {
-        version++;
-        tui.requestRender();
-      }
-    },
-    render(width) {
-      return [title, input.display(), "[enter] ok  [esc] cancel"].map((l) => fit(l, width));
-    },
-    invalidate() {}
-  };
-}
-function openSecret(ctx, title) {
-  return withDialog(() => ctx.ui.custom((tui, _theme, _kb, done) => buildSecretComponent(tui, done, title), OVERLAY_OPTIONS));
 }
 
 // src/ui/widget.ts
@@ -21434,6 +21518,7 @@ function createRuntime() {
   });
   const tracker = new TransferTracker;
   const grants = new Set;
+  const sudoPasswords = new Map;
   let boundCtx;
   let stopWidget;
   const updateStatus = () => {
@@ -21441,9 +21526,16 @@ function createRuntime() {
     boundCtx?.ui.setStatus(STATUS_KEY, count ? `ssh: ${count} connected` : undefined);
   };
   pool.onChange(updateStatus);
+  pool.onChange(() => {
+    const live = new Set(pool.list().map((c) => c.spec.id));
+    for (const id of sudoPasswords.keys())
+      if (!live.has(id))
+        sudoPasswords.delete(id);
+  });
   return {
     pool,
     grants,
+    sudoPasswords,
     tracker,
     rulesPath: defaultRulesPath(),
     knownHostsPath,
@@ -21452,7 +21544,7 @@ function createRuntime() {
     resolve,
     prompter: (ctx) => ({
       confirmHostKey: (info) => ctx.hasUI ? openHostKey(ctx, info) : Promise.resolve(false),
-      askSecret: (title) => ctx.hasUI ? openSecret(ctx, title) : Promise.resolve(undefined)
+      askSecret: (title) => ctx.hasUI ? openSecret(ctx, title).then((a) => a?.value) : Promise.resolve(undefined)
     }),
     bind(ctx) {
       if (boundCtx === ctx)
@@ -21465,6 +21557,7 @@ function createRuntime() {
     dispose() {
       pool.closeAll();
       grants.clear();
+      sudoPasswords.clear();
       stopWidget?.();
       stopWidget = undefined;
       boundCtx?.ui.setStatus(STATUS_KEY, undefined);

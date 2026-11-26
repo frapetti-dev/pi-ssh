@@ -6,6 +6,7 @@ import { type ExecDetails, formatExecText, truncateStream } from "../core/output
 import { loadRules } from "../core/settings";
 import type { Runtime } from "../runtime";
 import { openApproval } from "../ui/approval";
+import { n, txt } from "../ui/nodes";
 import { openSecret } from "../ui/secret";
 
 const DEFAULT_TIMEOUT_SEC = 120;
@@ -105,18 +106,6 @@ interface JobsModule {
 interface SettingsRegistry {
 	lookup(id: string): { get(settings: unknown): unknown } | undefined;
 }
-interface ShellRenderer {
-	describeCall: unknown;
-	describeResult(result: unknown, opts: unknown, args: unknown): unknown;
-}
-interface BashUi {
-	createShellRenderer(opts: {
-		resolveTitle(a?: ExecArgs): string;
-		resolveCommand(a?: ExecArgs): string | undefined;
-		resolveCwd(a?: ExecArgs): string | undefined;
-		showHeader: boolean;
-	}): ShellRenderer;
-}
 interface ExecArgs {
 	host?: string;
 	command?: string;
@@ -132,33 +121,12 @@ interface ExecResult {
 export async function registerExecTool(pi: ExtensionAPI, rt: Runtime): Promise<void> {
 	const z = pi.zod;
 	// omp has no public job/renderer API; these internal modules may move, so each degrades instead of breaking the extension.
-	const [jobs, registry, bashUi] = await Promise.all([
+	const [jobs, registry] = await Promise.all([
 		import("@oh-my-pi/pi-coding-agent/async").then(m => m as JobsModule, () => undefined),
 		import("@oh-my-pi/pi-coding-agent/config/registry").then(m => m as SettingsRegistry, () => undefined),
-		import("@oh-my-pi/pi-tui/tools/bash").then(m => m as BashUi, () => undefined),
 	]);
 	const setting = <T>(id: string): T | undefined =>
 		pi.pi?.settings ? (registry?.lookup(id)?.get(pi.pi.settings) as T | undefined) : undefined;
-	const shell = bashUi?.createShellRenderer({
-		resolveTitle: a => (a?.host ? `SSH · ${a.host}${a.sudo ? " (sudo)" : ""}` : "SSH"),
-		resolveCommand: a => a?.command,
-		resolveCwd: a => a?.cwd,
-		showHeader: false,
-	});
-	const card = (result: ExecResult, opts: unknown, args: unknown) => {
-		const d = result.details;
-		if (!("hostId" in d)) return shell!.describeResult(result, opts, args); // errors render as a failed bash run
-		const text = [d.stdout.trimEnd(), d.stderr.trimEnd()].filter(Boolean).join("\n");
-		return shell!.describeResult(
-			{
-				content: [{ type: "text", text }],
-				isError: result.isError === true || d.signal !== undefined,
-				details: { exitCode: d.exitCode ?? undefined, timedOut: d.timedOut, wallTimeMs: d.durationMs, async: d.async },
-			},
-			opts,
-			args,
-		);
-	};
 	pi.registerTool({
 		name: "ssh_exec",
 		label: "SSH exec",
@@ -335,6 +303,26 @@ export async function registerExecTool(pi: ExtensionAPI, rt: Runtime): Promise<v
 			}
 			return run(signal, d => onUpdate?.(toUpdate(d)));
 		},
-		...(shell && { describeCall: shell.describeCall, describeResult: card, mergeCallAndResult: true, inline: true }),
+		renderCall(args: ExecArgs) {
+			return txt([
+				{ t: `SSH · ${args.host ?? ""}${args.sudo ? " (sudo)" : ""} `, s: "toolTitle strong" },
+				{ t: args.command ?? "" },
+				...(args.cwd ? [{ t: `  in ${args.cwd}`, s: "muted" }] : []),
+			]);
+		},
+		renderResult(result: ExecResult, { expanded }: { expanded: boolean }) {
+			const d = result.details;
+			if (!("hostId" in d)) return txt([{ t: d.error, s: "error" }]);
+			const all = [d.stdout.trimEnd(), d.stderr.trimEnd()].filter(Boolean).join("\n");
+			const out = expanded ? all : all.split("\n").slice(-10).join("\n");
+			const status =
+				`exit ${d.exitCode ?? d.signal ?? "?"} · ${(d.durationMs / 1000).toFixed(1)}s` +
+				(d.timedOut ? " · timed out" : "") +
+				(d.async ? " · background" : "");
+			return n("col", { gap: "xs" }, [
+				...(out ? [txt(out)] : []),
+				txt([{ t: status, s: result.isError || d.signal !== undefined ? "error" : "muted" }]),
+			]);
+		},
 	});
 }

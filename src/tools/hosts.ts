@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { Runtime } from "../runtime";
-import { n } from "../ui/nodes";
+import { n, txt } from "../ui/nodes";
 
 export interface HostRow {
 	host: string;
@@ -39,25 +39,21 @@ export function registerHostsTool(pi: ExtensionAPI, rt: Runtime): void {
 				: "No hosts in ~/.ssh/config.";
 			return { content: [{ type: "text", text }], details: { rows } };
 		},
-		describeCall() {
-			return { tool: { title: "SSH hosts", target: "~/.ssh/config", targetKind: "path" } };
-		},
-		describeResult(result) {
-			const d = result.details as { rows: HostRow[] } | undefined;
+		renderCall: () => n("text", { spans: [{ t: "SSH hosts ", s: "toolTitle strong" }, { t: "~/.ssh/config", s: "muted" }] }),
+		renderResult(result: { details?: { rows: HostRow[] } }) {
+			const d = result.details;
 			if (!d) return undefined;
-			return {
-				tool: { title: "SSH hosts", meta: [`${d.rows.length} hosts`] },
-				body: [
-					n("table", {
-						cols: [
-							{ id: "host", head: "Host" },
-							{ id: "target", head: "Target" },
-							{ id: "state", head: "State" },
-						],
-						rows: d.rows.map(r => ({ id: r.host, cells: { host: r.host, target: r.target, state: r.state } })),
-					}),
-				],
-			};
+			return n("col", { gap: "sm" }, [
+				txt([{ t: `${d.rows.length} hosts`, s: "muted" }]),
+				n("table", {
+					cols: [
+						{ id: "host", head: "Host" },
+						{ id: "target", head: "Target" },
+						{ id: "state", head: "State" },
+					],
+					rows: d.rows.map(r => ({ id: r.host, cells: { host: r.host, target: r.target, state: r.state } })),
+				}),
+			]);
 		},
 	});
 }

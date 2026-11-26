@@ -6,7 +6,7 @@ import { humanBytes } from "../core/output";
 import { planTransfer, runTransfer, type TransferPlan } from "../core/transfer";
 import type { Runtime } from "../runtime";
 import { openApproval } from "../ui/approval";
-import { n } from "../ui/nodes";
+import { n, txt } from "../ui/nodes";
 import { errorResult } from "./exec";
 
 const MAX_ITEMS = 50;
@@ -163,40 +163,31 @@ export function registerTransferTool(pi: ExtensionAPI, rt: Runtime): void {
 				return failed ? { ...result, details: failed } : result;
 			}
 		},
-		describeCall(args) {
-			return {
-				tool: {
-					title: args.direction === "upload" ? "SSH upload" : "SSH download",
-					target: args.direction === "upload" ? args.localPath : args.remotePath,
-					targetKind: "path",
-					badges: [{ text: args.host, tone: "accent" }],
-				},
-			};
+		renderCall(args: { direction: string; host: string; localPath: string; remotePath: string }) {
+			const title = args.direction === "upload" ? "SSH upload" : "SSH download";
+			const target = args.direction === "upload" ? args.localPath : args.remotePath;
+			return n("row", { gap: "sm", align: "center" }, [
+				txt([{ t: `${title} `, s: "toolTitle strong" }, { t: target }]),
+				n("badge", { text: args.host, tone: "accent" }),
+			]);
 		},
-		describeResult(result) {
-			const d = result.details as TransferDetails | { error: string } | undefined;
+		renderResult(result: { details?: TransferDetails | { error: string } }) {
+			const d = result.details;
 			if (!d || !("hostId" in d)) return undefined;
 			const more = d.files - d.items.length;
-			return {
-				tool: {
-					title: d.direction === "upload" ? "SSH upload" : "SSH download",
-					target: d.direction === "upload" ? d.local : d.remote,
-					targetKind: "path",
-					meta: [d.hostId, `${d.filesDone}/${d.files} files`, humanBytes(d.bytes), ...(more > 0 ? [`+${more} more`] : [])],
-				},
-				open: true,
-				body: [
-					n("checklist", {
-						phases: [
-							{
-								id: "files",
-								title: `${d.direction} ${d.hostId}`,
-								items: d.items.map((it, i) => ({ id: String(i), text: it.path, status: it.status })),
-							},
-						],
-					}),
-				],
-			};
+			const meta = [d.hostId, `${d.filesDone}/${d.files} files`, humanBytes(d.bytes), ...(more > 0 ? [`+${more} more`] : [])];
+			return n("col", { gap: "sm" }, [
+				txt([{ t: meta.join(" · "), s: "muted" }]),
+				n("checklist", {
+					phases: [
+						{
+							id: "files",
+							title: `${d.direction} ${d.hostId}`,
+							items: d.items.map((it, i) => ({ id: String(i), text: it.path, status: it.status })),
+						},
+					],
+				}),
+			]);
 		},
 	});
 }

@@ -1,6 +1,6 @@
 {
   "name": "@frapetti-dev/pi-ssh",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Safe SSH connect, remote commands and file transfer for omp",
   "author": "frapetti-dev (https://github.com/frapetti-dev)",
   "type": "module",
@@ -34,6 +34,8 @@
     "test": "bun test"
   },
   "devDependencies": {
+    "@oh-my-pi/pi-tui": "19.2.1",
+    "@oh-my-pi/pi-wire": "19.2.1",
     "@types/ssh2": "^1.15.6",
     "ssh-config": "^5.3.0",
     "ssh2": "^1.17.0"

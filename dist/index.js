@@ -20506,9 +20506,30 @@ function humanBytes(n) {
 }
 
 // src/ui/nodes.ts
-import { matchesKey } from "@oh-my-pi/pi-tui";
+import { jsx, signal } from "@oh-my-pi/pi-tui";
+function mount(build) {
+  const tick = signal(0);
+  const view = build(() => tick.update((v) => v + 1));
+  return jsx("col", {
+    children: () => {
+      tick();
+      return view.describe();
+    },
+    onKey: (key) => {
+      if (key.kind === "release")
+        return false;
+      view.handleKey(key);
+      return true;
+    },
+    onPaste: (p) => {
+      view.handlePaste?.(p.text);
+      return true;
+    },
+    onEvent: (e) => view.handleEvent?.(e)
+  });
+}
 function n(k, p, c, key) {
-  return { k, p, c, key };
+  return jsx(k, c === undefined ? { ...p } : { ...p, children: c }, key);
 }
 function txt(s, p = {}) {
   return typeof s === "string" ? n("text", { ...p, text: s }) : n("text", { ...p, spans: s });
@@ -20542,34 +20563,13 @@ function fit(line, width) {
     return "";
   return line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}\u2026`;
 }
-function isKey(data, id) {
-  return matchesKey(data, id);
-}
-function isClose(data) {
-  return isKey(data, "escape") || data === "q";
-}
 function leafKey(path) {
   return path.slice(path.lastIndexOf("/") + 1);
 }
 
-class Memo {
-  #deps;
-  #value;
-  get(deps, build) {
-    const d = this.#deps;
-    if (this.#value && d && d.length === deps.length && d.every((v, i) => Object.is(v, deps[i]))) {
-      return this.#value;
-    }
-    this.#deps = deps;
-    this.#value = build();
-    return this.#value;
-  }
-}
-
 // src/ui/dialog.ts
-var OVERLAY_OPTIONS = { overlay: true, overlayOptions: { width: "80%" } };
+var OVERLAY_OPTIONS = { overlay: true };
 function buildDialog(spec, done) {
-  const memo = new Memo;
   let finished = false;
   const real = spec.buttons.filter((b) => b !== null);
   const choose = (act) => {
@@ -20579,56 +20579,31 @@ function buildDialog(spec, done) {
     finished = true;
     done(b.value);
   };
-  const hint = real.map((b) => `[${b.key === "escape" ? "esc" : b.key}] ${b.label.toLowerCase()}`).join("  ");
   return {
-    nativeOverlay: { role: "omp.overlay.pi-ssh", head: spec.head },
-    describe(cx) {
-      return memo.get([cx.dark], () => framed([
+    describe() {
+      return framed([
+        heading(spec.head),
         heading(spec.title),
         ...spec.body,
         bar(spec.buttons.map((b) => b ? button(b.label, b.act, b.key) : null))
-      ], "md"));
+      ], "md");
     },
-    handleNativeEvent(e) {
+    handleEvent(e) {
       if (e.type === "action")
         choose(e.act);
     },
-    handleInput(data) {
-      const alias = spec.aliases?.[data];
+    handleKey(key) {
+      const alias = spec.aliases?.[key.id];
       if (alias)
         return choose(alias);
-      choose(real.find((b) => data === b.key || isKey(data, b.key))?.act);
-    },
-    render(width) {
-      return [spec.title, ...spec.ansi, hint].map((l) => fit(l, width));
-    },
-    invalidate() {}
+      choose(real.find((b) => key.id === b.key)?.act);
+    }
   };
-}
-
-// src/ui/focus.ts
-var refocus;
-var open = 0;
-function registerPane(fn) {
-  refocus = fn;
-  return () => {
-    if (refocus === fn)
-      refocus = undefined;
-  };
-}
-async function withDialog(show) {
-  open++;
-  try {
-    return await show();
-  } finally {
-    if (--open === 0)
-      refocus?.();
-  }
 }
 
 // src/ui/approval.ts
 var target = (h) => `${h.user}@${h.hostName}:${h.port}`;
-function buildApprovalComponent(_tui, done, req) {
+function buildApprovalComponent(done, req) {
   const buttons = [
     { label: "Allow once", act: "once", key: "y", value: "once" }
   ];
@@ -20647,18 +20622,10 @@ function buildApprovalComponent(_tui, done, req) {
       title: req.sudo ? `Run command as root on ${req.host.id}?` : `Run command on ${req.host.id}?`,
       body: [n("kv", { items: kv }), n("code", { text: req.command, lang: "bash" }), prose(req.reason)],
       buttons,
-      ansi: [
-        `host: ${target(req.host)}`,
-        ...req.sudo ? ["as: root (sudo)"] : [],
-        ...req.cwd ? [`cwd: ${req.cwd}`] : [],
-        `$ ${req.command}`,
-        req.reason
-      ],
       aliases: { n: "deny" }
     }, done);
   }
   const verb = req.direction === "upload" ? "Upload to" : "Download from";
-  const arrow = req.direction === "upload" ? `${req.local} -> ${req.remote}` : `${req.remote} -> ${req.local}`;
   const kv = [
     { k: "host", v: target(req.host) },
     { k: "files", v: `${req.files} (${humanBytes(req.totalBytes)})` },
@@ -20671,20 +20638,15 @@ function buildApprovalComponent(_tui, done, req) {
     title: `${verb} ${req.host.id}?`,
     body: [n("kv", { items: kv }), prose(req.reason)],
     buttons,
-    ansi: [`host: ${target(req.host)}`, arrow, `${req.files} files (${humanBytes(req.totalBytes)}), ${req.existing} overwrites`, req.reason],
     aliases: { n: "deny" }
   }, done);
 }
 async function openApproval(ctx, req) {
-  const result = await withDialog(() => ctx.ui.custom((tui, _theme, _kb, done) => buildApprovalComponent(tui, done, req), OVERLAY_OPTIONS));
+  const result = await ctx.ui.custom((_ui, _theme, _kb, done) => mount(() => buildApprovalComponent(done, req)), OVERLAY_OPTIONS);
   return result ?? "deny";
 }
 
 // src/ui/line-input.ts
-var PASTE_START = "\x1B[200~";
-var PASTE_END = "\x1B[201~";
-var PRINTABLE = /^[^\x00-\x1f\x7f]+$/;
-
 class LineInput {
   opts;
   value;
@@ -20694,47 +20656,51 @@ class LineInput {
     this.value = initial;
     this.cursor = initial.length;
   }
-  handleInput(data) {
-    const text = data.startsWith(PASTE_START) ? data.slice(PASTE_START.length).replace(PASTE_END, "") : data;
-    const flat = text.replace(/[\r\n]/g, "");
-    if (flat && PRINTABLE.test(flat)) {
-      this.value = this.value.slice(0, this.cursor) + flat + this.value.slice(this.cursor);
-      this.cursor += flat.length;
-      return true;
-    }
-    if (isKey(data, "backspace")) {
+  handleKey(key) {
+    const id = key.id;
+    if (id === "backspace") {
       if (this.cursor > 0) {
         this.value = this.value.slice(0, this.cursor - 1) + this.value.slice(this.cursor);
         this.cursor--;
       }
       return true;
     }
-    if (isKey(data, "delete")) {
+    if (id === "delete") {
       this.value = this.value.slice(0, this.cursor) + this.value.slice(this.cursor + 1);
       return true;
     }
-    if (isKey(data, "left")) {
+    if (id === "left") {
       this.cursor = Math.max(0, this.cursor - 1);
       return true;
     }
-    if (isKey(data, "right")) {
+    if (id === "right") {
       this.cursor = Math.min(this.value.length, this.cursor + 1);
       return true;
     }
-    if (isKey(data, "home")) {
+    if (id === "home") {
       this.cursor = 0;
       return true;
     }
-    if (isKey(data, "end")) {
+    if (id === "end") {
       this.cursor = this.value.length;
       return true;
     }
-    if (isKey(data, "ctrl+u")) {
+    if (id === "ctrl+u") {
       this.value = "";
       this.cursor = 0;
       return true;
     }
+    const text = key.text?.replace(/[\r\n]/g, "");
+    if (text && !/[\x00-\x1f\x7f]/.test(text) && !/^(ctrl|alt|super)\+/.test(id)) {
+      this.paste(text);
+      return true;
+    }
     return false;
+  }
+  paste(text) {
+    const flat = text.replace(/\r?\n/g, "");
+    this.value = this.value.slice(0, this.cursor) + flat + this.value.slice(this.cursor);
+    this.cursor += flat.length;
   }
   display() {
     return this.opts.masked ? "\u2022".repeat(this.value.length) : this.value;
@@ -20745,10 +20711,8 @@ class LineInput {
 }
 
 // src/ui/secret.ts
-function buildSecretComponent(tui, done, title, offerRemember = false) {
+function buildSecretComponent(refresh, done, title, offerRemember = false) {
   const input = new LineInput("", { masked: true });
-  const memo = new Memo;
-  let version = 0;
   let finished = false;
   let remember = false;
   const finish = (answer) => {
@@ -20760,13 +20724,12 @@ function buildSecretComponent(tui, done, title, offerRemember = false) {
   const answer = () => ({ value: input.value, remember });
   const toggle = () => {
     remember = !remember;
-    version++;
-    tui.requestRender();
+    refresh();
   };
   return {
-    nativeOverlay: { role: "omp.overlay.pi-ssh", head: "SSH" },
-    describe(cx) {
-      return memo.get([cx.dark, version], () => framed([
+    describe() {
+      return framed([
+        heading("SSH"),
         heading(title),
         input.node({ key: "secret", focused: true }),
         ...offerRemember ? [
@@ -20781,9 +20744,9 @@ function buildSecretComponent(tui, done, title, offerRemember = false) {
           ], "remember")
         ] : [],
         bar([button("OK", "ok", "enter"), null, button("Cancel", "cancel", "escape")])
-      ], "md"));
+      ], "md");
     },
-    handleNativeEvent(e) {
+    handleEvent(e) {
       if (e.type !== "action")
         return;
       if (e.act === "ok")
@@ -20793,31 +20756,24 @@ function buildSecretComponent(tui, done, title, offerRemember = false) {
       else if (e.act === "remember" && offerRemember)
         toggle();
     },
-    handleInput(data) {
-      if (isKey(data, "enter"))
+    handleKey(key) {
+      if (key.id === "enter")
         return finish(answer());
-      if (isKey(data, "escape"))
+      if (key.id === "escape")
         return finish(undefined);
-      if (offerRemember && isKey(data, "tab"))
+      if (offerRemember && key.id === "tab")
         return toggle();
-      if (input.handleInput(data)) {
-        version++;
-        tui.requestRender();
-      }
+      if (input.handleKey(key))
+        refresh();
     },
-    render(width) {
-      return [
-        title,
-        input.display(),
-        ...offerRemember ? [`[${remember ? "x" : " "}] remember for this omp session  [tab] toggle`] : [],
-        "[enter] ok  [esc] cancel"
-      ].map((l) => fit(l, width));
-    },
-    invalidate() {}
+    handlePaste(text) {
+      input.paste(text);
+      refresh();
+    }
   };
 }
 function openSecret(ctx, title, offerRemember = false) {
-  return withDialog(() => ctx.ui.custom((tui, _theme, _kb, done) => buildSecretComponent(tui, done, title, offerRemember), OVERLAY_OPTIONS));
+  return ctx.ui.custom((_ui, _theme, _kb, done) => mount((refresh) => buildSecretComponent(refresh, done, title, offerRemember)), OVERLAY_OPTIONS);
 }
 
 // src/tools/exec.ts
@@ -20871,36 +20827,15 @@ async function runCommand(rt, ctx, spec, command, opts) {
 var lastWarning;
 async function registerExecTool(pi, rt) {
   const z = pi.zod;
-  const [jobs, registry, bashUi] = await Promise.all([
+  const [jobs, registry] = await Promise.all([
     import("@oh-my-pi/pi-coding-agent/async").then((m) => m, () => {
       return;
     }),
     import("@oh-my-pi/pi-coding-agent/config/registry").then((m) => m, () => {
       return;
-    }),
-    import("@oh-my-pi/pi-tui/tools/bash").then((m) => m, () => {
-      return;
     })
   ]);
   const setting = (id) => pi.pi?.settings ? registry?.lookup(id)?.get(pi.pi.settings) : undefined;
-  const shell = bashUi?.createShellRenderer({
-    resolveTitle: (a) => a?.host ? `SSH \xB7 ${a.host}${a.sudo ? " (sudo)" : ""}` : "SSH",
-    resolveCommand: (a) => a?.command,
-    resolveCwd: (a) => a?.cwd,
-    showHeader: false
-  });
-  const card = (result, opts, args) => {
-    const d = result.details;
-    if (!("hostId" in d))
-      return shell.describeResult(result, opts, args);
-    const text = [d.stdout.trimEnd(), d.stderr.trimEnd()].filter(Boolean).join(`
-`);
-    return shell.describeResult({
-      content: [{ type: "text", text }],
-      isError: result.isError === true || d.signal !== undefined,
-      details: { exitCode: d.exitCode ?? undefined, timedOut: d.timedOut, wallTimeMs: d.durationMs, async: d.async }
-    }, opts, args);
-  };
   pi.registerTool({
     name: "ssh_exec",
     label: "SSH exec",
@@ -21059,7 +20994,28 @@ ${notice(jobId)}` : notice(jobId) }],
       }
       return run(signal, (d) => onUpdate?.(toUpdate(d)));
     },
-    ...shell && { describeCall: shell.describeCall, describeResult: card, mergeCallAndResult: true, inline: true }
+    renderCall(args) {
+      return txt([
+        { t: `SSH \xB7 ${args.host ?? ""}${args.sudo ? " (sudo)" : ""} `, s: "toolTitle strong" },
+        { t: args.command ?? "" },
+        ...args.cwd ? [{ t: `  in ${args.cwd}`, s: "muted" }] : []
+      ]);
+    },
+    renderResult(result, { expanded }) {
+      const d = result.details;
+      if (!("hostId" in d))
+        return txt([{ t: d.error, s: "error" }]);
+      const all = [d.stdout.trimEnd(), d.stderr.trimEnd()].filter(Boolean).join(`
+`);
+      const out = expanded ? all : all.split(`
+`).slice(-10).join(`
+`);
+      const status = `exit ${d.exitCode ?? d.signal ?? "?"} \xB7 ${(d.durationMs / 1000).toFixed(1)}s` + (d.timedOut ? " \xB7 timed out" : "") + (d.async ? " \xB7 background" : "");
+      return n("col", { gap: "xs" }, [
+        ...out ? [txt(out)] : [],
+        txt([{ t: status, s: result.isError || d.signal !== undefined ? "error" : "muted" }])
+      ]);
+    }
   });
 }
 
@@ -21186,41 +21142,32 @@ function registerTransferTool(pi, rt) {
         return failed ? { ...result, details: failed } : result;
       }
     },
-    describeCall(args) {
-      return {
-        tool: {
-          title: args.direction === "upload" ? "SSH upload" : "SSH download",
-          target: args.direction === "upload" ? args.localPath : args.remotePath,
-          targetKind: "path",
-          badges: [{ text: args.host, tone: "accent" }]
-        }
-      };
+    renderCall(args) {
+      const title = args.direction === "upload" ? "SSH upload" : "SSH download";
+      const target = args.direction === "upload" ? args.localPath : args.remotePath;
+      return n("row", { gap: "sm", align: "center" }, [
+        txt([{ t: `${title} `, s: "toolTitle strong" }, { t: target }]),
+        n("badge", { text: args.host, tone: "accent" })
+      ]);
     },
-    describeResult(result) {
+    renderResult(result) {
       const d = result.details;
       if (!d || !("hostId" in d))
         return;
       const more = d.files - d.items.length;
-      return {
-        tool: {
-          title: d.direction === "upload" ? "SSH upload" : "SSH download",
-          target: d.direction === "upload" ? d.local : d.remote,
-          targetKind: "path",
-          meta: [d.hostId, `${d.filesDone}/${d.files} files`, humanBytes(d.bytes), ...more > 0 ? [`+${more} more`] : []]
-        },
-        open: true,
-        body: [
-          n("checklist", {
-            phases: [
-              {
-                id: "files",
-                title: `${d.direction} ${d.hostId}`,
-                items: d.items.map((it, i) => ({ id: String(i), text: it.path, status: it.status }))
-              }
-            ]
-          })
-        ]
-      };
+      const meta = [d.hostId, `${d.filesDone}/${d.files} files`, humanBytes(d.bytes), ...more > 0 ? [`+${more} more`] : []];
+      return n("col", { gap: "sm" }, [
+        txt([{ t: meta.join(" \xB7 "), s: "muted" }]),
+        n("checklist", {
+          phases: [
+            {
+              id: "files",
+              title: `${d.direction} ${d.hostId}`,
+              items: d.items.map((it, i) => ({ id: String(i), text: it.path, status: it.status }))
+            }
+          ]
+        })
+      ]);
     }
   });
 }
@@ -21467,7 +21414,7 @@ class TransferTracker {
 }
 
 // src/ui/hostkey.ts
-function buildHostKeyComponent(_tui, done, info) {
+function buildHostKeyComponent(done, info) {
   const field = hostField(info.host.hostName, info.host.port);
   const note = "First connection to this host. Verify the fingerprint out of band before trusting." + (info.knownTypes.length ? ` Known with other key types: ${info.knownTypes.join(", ")}.` : "");
   return buildDialog({
@@ -21486,12 +21433,11 @@ function buildHostKeyComponent(_tui, done, info) {
       { label: "Trust and save", act: "trust", key: "t", value: true },
       null,
       { label: "Cancel", act: "cancel", key: "escape", value: false }
-    ],
-    ansi: [`type: ${info.type}`, `fingerprint: ${info.fingerprint}`, note]
+    ]
   }, done);
 }
 async function openHostKey(ctx, info) {
-  const result = await withDialog(() => ctx.ui.custom((tui, _theme, _kb, done) => buildHostKeyComponent(tui, done, info), OVERLAY_OPTIONS));
+  const result = await ctx.ui.custom((_ui, _theme, _kb, done) => mount(() => buildHostKeyComponent(done, info)), OVERLAY_OPTIONS);
   return result === true;
 }
 
@@ -21500,40 +21446,22 @@ var KEY = "pi-ssh";
 var MIN_RENDER_INTERVAL_MS = 200;
 var CLEAR_DELAY_MS = 3000;
 var transferArrow = (t) => t.direction === "upload" ? "\u2191" : "\u2193";
-function buildProgressComponent(tui, tracker, listActive) {
-  let version = 0;
+function buildProgressComponent(ui, tracker, listActive) {
   let lastRender = 0;
-  let cached;
   const unsubscribe = tracker.subscribe(() => {
     const now = Date.now();
     if (now - lastRender < MIN_RENDER_INTERVAL_MS)
       return;
     lastRender = now;
-    version++;
-    tui.requestRender();
+    ui.requestRender();
   });
   return {
-    describe(_cx) {
-      if (cached?.version === version)
-        return cached.node;
-      const rows = listActive().map((t) => n("row", { gap: "sm", align: "center" }, [
-        n("spinner", { style: "orbit" }),
-        txt(`${transferArrow(t)} ${t.label}`),
-        n("progress", { value: t.totalBytes > 0 ? t.doneBytes / t.totalBytes : null }),
-        n("rate", { value: t.bytesPerSec, unit: "B/s" }),
-        txt(`${t.filesDone}/${t.files}`)
-      ], `t${t.id}`));
-      const node = n("col", { gap: "xs" }, rows);
-      cached = { version, node };
-      return node;
-    },
     render(width) {
       return listActive().map((t) => {
         const pct = t.totalBytes > 0 ? Math.floor(t.doneBytes / t.totalBytes * 100) : 0;
         return fit(`${transferArrow(t)} ${t.label} ${pct}% ${humanBytes(Math.round(t.bytesPerSec))}/s ${t.filesDone}/${t.files} files`, width);
       });
     },
-    invalidate() {},
     dispose() {
       unsubscribe();
     }
@@ -21559,7 +21487,7 @@ function syncProgressWidget(ctx, tracker) {
       cancelClear();
       if (!shown) {
         shown = true;
-        ctx.ui.setWidget(KEY, (tui) => buildProgressComponent(tui, tracker, () => tracker.active()), { placement: "aboveEditor" });
+        ctx.ui.setWidget(KEY, (ui) => buildProgressComponent(ui, tracker, () => tracker.active()), { placement: "aboveEditor" });
       }
     } else if (shown && clearTimer === undefined) {
       clearTimer = ctx.setTimeout(hide, CLEAR_DELAY_MS);
@@ -21672,26 +21600,22 @@ function registerHostsTool(pi, rt) {
 `) : "No hosts in ~/.ssh/config.";
       return { content: [{ type: "text", text }], details: { rows } };
     },
-    describeCall() {
-      return { tool: { title: "SSH hosts", target: "~/.ssh/config", targetKind: "path" } };
-    },
-    describeResult(result) {
+    renderCall: () => n("text", { spans: [{ t: "SSH hosts ", s: "toolTitle strong" }, { t: "~/.ssh/config", s: "muted" }] }),
+    renderResult(result) {
       const d = result.details;
       if (!d)
         return;
-      return {
-        tool: { title: "SSH hosts", meta: [`${d.rows.length} hosts`] },
-        body: [
-          n("table", {
-            cols: [
-              { id: "host", head: "Host" },
-              { id: "target", head: "Target" },
-              { id: "state", head: "State" }
-            ],
-            rows: d.rows.map((r) => ({ id: r.host, cells: { host: r.host, target: r.target, state: r.state } }))
-          })
-        ]
-      };
+      return n("col", { gap: "sm" }, [
+        txt([{ t: `${d.rows.length} hosts`, s: "muted" }]),
+        n("table", {
+          cols: [
+            { id: "host", head: "Host" },
+            { id: "target", head: "Target" },
+            { id: "state", head: "State" }
+          ],
+          rows: d.rows.map((r) => ({ id: r.host, cells: { host: r.host, target: r.target, state: r.state } }))
+        })
+      ]);
     }
   });
 }
@@ -21712,30 +21636,35 @@ class Form {
     this.fields = fields;
     this.submitLabel = submitLabel;
   }
-  handleInput(data) {
-    const result = this.route(data);
+  handleKey(key) {
+    const result = this.route(key);
     if (result !== "ignored")
       this.error = undefined;
     return result;
   }
-  route(data) {
-    if (isKey(data, "escape"))
+  route(key) {
+    if (key.id === "escape")
       return "cancel";
-    if (isKey(data, "tab") || isKey(data, "down"))
+    if (key.id === "tab" || key.id === "down")
       return this.move(1);
-    if (isKey(data, "shift+tab") || isKey(data, "up"))
+    if (key.id === "shift+tab" || key.id === "up")
       return this.move(-1);
-    if (isKey(data, "enter"))
+    if (key.id === "enter")
       return this.focus === this.fields.length - 1 ? "submit" : this.move(1);
     const field = this.fields[this.focus];
     if (field?.kind === "toggle") {
-      if (isKey(data, "space")) {
+      if (key.id === "space") {
         field.on = !field.on;
         return "handled";
       }
       return "ignored";
     }
-    return field?.input.handleInput(data) ? "handled" : "ignored";
+    return field?.input.handleKey(key) ? "handled" : "ignored";
+  }
+  handlePaste(text) {
+    const field = this.fields[this.focus];
+    if (field?.kind === "text")
+      field.input.paste(text);
   }
   move(delta) {
     this.focus = (this.focus + delta + this.fields.length) % this.fields.length;
@@ -21782,15 +21711,6 @@ class Form {
       bar([button(this.submitLabel, "form-submit", "enter"), null, button("Cancel", "form-cancel", "escape")], "form-actions")
     ], "form");
   }
-  ansi() {
-    const lines = this.fields.map((f, i) => {
-      const mark = i === this.focus ? "> " : "  ";
-      return `${mark}${f.label}: ${f.kind === "text" ? f.input.display() : f.on ? "[x]" : "[ ]"}`;
-    });
-    if (this.error)
-      lines.push(`  ${this.error}`);
-    return lines;
-  }
 }
 
 // src/ui/pane.ts
@@ -21798,12 +21718,11 @@ var TAB_ORDER = ["hosts", "transfers", "security"];
 var clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 var target2 = (h) => `${h.user}@${h.hostName}:${h.port}${h.proxyJump ? ` via ${h.proxyJump}` : ""}`;
 var errorText = (e) => e instanceof Error ? e.message : String(e);
-var keyLabel = (k) => k === "escape" ? "esc" : k;
 var seconds = (ms) => (ms / 1000).toFixed(1);
 function entryNote(e) {
   return `${e.type}  ${e.fingerprint}${e.hashed ? " (hashed)" : ""}${e.revoked ? " (revoked)" : ""}${!e.removable && !e.revoked ? " (pattern, not removable)" : ""}`;
 }
-function buildPane(tui, done, model, opts) {
+function buildPane(refresh, done, model, opts) {
   let tab = "hosts";
   let selected = opts.preselect ?? "";
   let selectedGrant = "";
@@ -21816,7 +21735,6 @@ function buildPane(tui, done, model, opts) {
   let message;
   let version = 0;
   let finished = false;
-  let unregister;
   let hostsCache;
   const allHosts = () => {
     if (hostsCache?.version !== version)
@@ -21850,7 +21768,7 @@ function buildPane(tui, done, model, opts) {
     if (!grants.includes(selectedGrant))
       selectedGrant = grants[0] ?? "";
     loadKeys();
-    tui.requestRender();
+    refresh();
   };
   const task = (p) => {
     p.then((text) => {
@@ -21875,7 +21793,6 @@ function buildPane(tui, done, model, opts) {
       return;
     finished = true;
     unsub();
-    unregister?.();
     for (const r of running.values())
       r.controller.abort();
   };
@@ -22147,7 +22064,7 @@ function buildPane(tui, done, model, opts) {
       selectedGrant = grants[clamp(i + delta, 0, grants.length - 1)] ?? selectedGrant;
     }
   };
-  const onEvent = (e) => {
+  const handleEvent = (e) => {
     if (e.type === "select" || e.type === "activate") {
       const leaf = leafKey(e.key);
       if (leaf === "tabs")
@@ -22172,48 +22089,58 @@ function buildPane(tui, done, model, opts) {
     }
     bump();
   };
-  const handleKey = (data) => {
+  const handleKey = (key) => {
+    const id = key.id;
     if (mode.kind === "confirm") {
-      if (data === "y")
+      if (id === "y")
         confirmAnswer(true);
-      else if (data === "n" || isKey(data, "escape"))
+      else if (id === "n" || id === "escape")
         confirmAnswer(false);
       return;
     }
     if (mode.kind === "form") {
-      applyFormResult(mode.form.handleInput(data));
+      applyFormResult(mode.form.handleKey(key));
       return;
     }
     if (filtering) {
-      if (isKey(data, "enter"))
+      if (id === "enter")
         filtering = false;
-      else if (isKey(data, "escape")) {
+      else if (id === "escape") {
         filter.value = "";
         filter.cursor = 0;
         filtering = false;
-      } else if (isKey(data, "up"))
+      } else if (id === "up")
         move(-1);
-      else if (isKey(data, "down"))
+      else if (id === "down")
         move(1);
       else
-        filter.handleInput(data);
+        filter.handleKey(key);
       return;
     }
-    const digit = ["1", "2", "3"].indexOf(data);
+    const digit = ["1", "2", "3"].indexOf(id);
     if (digit >= 0)
       return setTab(TAB_ORDER[digit]);
-    if (isKey(data, "up"))
+    if (id === "up")
       return move(-1);
-    if (isKey(data, "down"))
+    if (id === "down")
       return move(1);
     const available = actions();
-    if (isKey(data, "enter") && tab === "hosts" && available.some((a) => a.act === "connect"))
+    if (id === "enter" && tab === "hosts" && available.some((a) => a.act === "connect"))
       return act("connect");
-    if (isClose(data) && !available.some((a) => a.key === data && a.key !== "escape"))
+    if ((id === "escape" || id === "q") && !available.some((a) => a.key === id && a.key !== "escape"))
       return finish();
-    const hit = available.find((a) => a.key === "escape" ? isKey(data, "escape") : a.key === data);
+    const hit = available.find((a) => a.key === id);
     if (hit)
       act(hit.act);
+  };
+  const handlePaste = (text) => {
+    if (mode.kind === "form")
+      mode.form.handlePaste(text);
+    else if (filtering)
+      filter.paste(text);
+    else
+      return;
+    bump();
   };
   const hostsTab = () => {
     const sel = current();
@@ -22353,139 +22280,58 @@ function buildPane(tui, done, model, opts) {
     }
     return n("col", { gap: "md" }, [n("section", { head: "Host Grants" }, grantBody, "grants-section"), n("section", { head: "Rules" }, ruleBody, "rules")], "security");
   };
-  const bodyMemo = new Memo;
-  const body = {
-    describe(_cx) {
-      return bodyMemo.get([version], () => {
-        const active = activeCount();
-        const tabs = n("tabs", {
-          items: [
-            { id: "hosts", label: "Hosts" },
-            { id: "transfers", label: `Transfers${active ? ` (${active})` : ""}` },
-            { id: "security", label: "Security" }
-          ],
-          active: tab
-        }, undefined, "tabs");
-        const content = tab === "hosts" ? hostsTab() : tab === "transfers" ? transfersTab() : securityTab();
-        return n("col", { gap: "md" }, [tabs, content], "body");
-      });
-    },
-    handleNativeEvent: onEvent,
-    render() {
-      return [];
-    },
-    invalidate() {}
-  };
   const hints = () => mode.kind === "form" ? "tab next field \xB7 enter submit \xB7 esc cancel" : mode.kind === "confirm" ? "y yes \xB7 n no" : "\u2191\u2193 select \xB7 1-3 tabs \xB7 / filter \xB7 esc close";
-  const rootMemo = new Memo;
-  const root = {
-    describeScreen(_cx) {
-      return { role: "pi-ssh.screen", main: [body], dock: [root] };
-    },
-    describe(_cx) {
-      return rootMemo.get([version], () => n("col", { gap: "sm" }, [
+  const describe = () => {
+    const active = activeCount();
+    const tabs = n("tabs", {
+      items: [
+        { id: "hosts", label: "Hosts" },
+        { id: "transfers", label: `Transfers${active ? ` (${active})` : ""}` },
+        { id: "security", label: "Security" }
+      ],
+      active: tab
+    }, undefined, "tabs");
+    const content = tab === "hosts" ? hostsTab() : tab === "transfers" ? transfersTab() : securityTab();
+    return n("col", { gap: "md" }, [
+      n("col", { gap: "md" }, [tabs, content], "body"),
+      n("col", { gap: "sm" }, [
         n("status", {}, [
           n("seg", { spans: [{ t: `${model.hosts().filter((h) => model.connection(h.id)).length} connected \xB7 ${activeCount()} transferring` }], side: "left" }),
           ...message ? [n("seg", { spans: [{ t: message.text, s: message.tone === "error" ? "error" : undefined }], side: "left" })] : [],
           n("seg", { spans: [{ t: hints(), s: "muted" }], side: "right" })
         ]),
         bar(actions().map((a) => button(a.label, a.act, a.key)))
-      ]));
-    },
-    handleNativeEvent: onEvent,
-    handleInput(data) {
+      ])
+    ], "pane");
+  };
+  const pane = {
+    describe,
+    handleKey(key) {
       if (finished)
         return;
       message = undefined;
-      handleKey(data);
+      handleKey(key);
       if (!finished)
         bump();
     },
-    render(width) {
-      const connected = model.hosts().filter((h) => model.connection(h.id)).length;
-      const tabLine = TAB_ORDER.map((t) => {
-        const label = t[0].toUpperCase() + t.slice(1);
-        return t === tab ? `[${label}]` : label;
-      }).join(" ");
-      const lines = [`SSH  ${tabLine}  \xB7  ${connected} connected`];
-      if (tab === "hosts") {
-        if (filtering || filter.value)
-          lines.push(`/ ${filter.value}`);
-        const list = visible();
-        for (const h of list) {
-          const state = model.connection(h.id) ? "*" : model.connecting(h.id) ? "~" : " ";
-          lines.push(`${h.id === selected ? ">" : " "} ${state} ${h.id} - ${h.error ?? (h.spec ? target2(h.spec) : "")}`);
-        }
-        if (!list.length)
-          lines.push("No hosts. Press n to add one.");
-        if (mode.kind === "form")
-          lines.push(mode.form.title, ...mode.form.ansi());
-        else if (mode.kind === "confirm")
-          lines.push(mode.text);
-        const live = running.get(selected);
-        const last = live?.partial ?? model.lastRun(selected);
-        if (last) {
-          lines.push(`exit ${live ? "running" : exitLabel(last)} \xB7 ${seconds(last.durationMs)}s \xB7 ${last.command}`);
-          lines.push(...last.stdout.split(`
-`).filter(Boolean).slice(-5));
-        }
-      } else if (tab === "transfers") {
-        const list = model.transfers();
-        if (!list.length)
-          lines.push("No Transfers in this omp session.");
-        for (const t of list) {
-          if (t.state === "running") {
-            const pct = t.totalBytes > 0 ? Math.floor(t.doneBytes / t.totalBytes * 100) : 0;
-            lines.push(`${transferArrow(t)} ${t.label} ${t.hostId} ${pct}% ${humanBytes(Math.round(t.bytesPerSec))}/s ${t.filesDone}/${t.files}`);
-          } else if (t.state === "done")
-            lines.push(`${transferArrow(t)} ${t.label} ${t.hostId} done ${humanBytes(t.totalBytes)}`);
-          else
-            lines.push(`${transferArrow(t)} ${t.label} ${t.hostId} error: ${t.error ?? "failed"}`);
-        }
-      } else {
-        const grants = model.grants();
-        if (!grants.length)
-          lines.push("No Host Grants.");
-        for (const g of grants)
-          lines.push(`${g === selectedGrant ? ">" : " "} ${g} (always-allow)`);
-        if (rules) {
-          lines.push(`Rules: ${rules.allow.length} allow, ${rules.deny.length} deny \xB7 ${rules.path}`);
-          if (rules.warning)
-            lines.push(rules.warning);
-        } else
-          lines.push("Loading rules\u2026");
-      }
-      if (message)
-        lines.push(message.text);
-      lines.push(actions().map((a) => `[${keyLabel(a.key)}] ${a.label}`).join("  "));
-      return lines.map((l) => fit(l, width));
-    },
-    invalidate() {},
-    dispose() {
-      teardown();
-    },
-    attach(h) {
-      unregister?.();
-      unregister = registerPane(() => {
-        h.setHidden(true);
-        h.setHidden(false);
-        bump();
-      });
-    }
+    handlePaste,
+    handleEvent,
+    dispose: teardown
   };
   if (opts.preselect)
     selected = opts.preselect;
   bump();
   if (opts.autoConnect && opts.preselect && actions().some((a) => a.act === "connect"))
     act("connect");
-  return root;
+  return pane;
 }
 async function openPane(ctx, model, opts) {
   let pane;
-  await ctx.ui.custom((tui, _theme, _kb, done) => {
-    pane = buildPane(tui, done, model, opts);
-    return pane;
-  }, { overlay: true, overlayOptions: { fullscreen: true }, onHandle: (h) => pane?.attach(h) });
+  try {
+    await ctx.ui.custom((_ui, _theme, _kb, done) => mount((refresh) => pane = buildPane(refresh, done, model, opts)), { overlay: true, fullscreen: true });
+  } finally {
+    pane?.dispose();
+  }
 }
 
 // src/index.ts

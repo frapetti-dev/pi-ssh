@@ -1,10 +1,8 @@
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { Component } from "@oh-my-pi/pi-tui";
 import type { HostSpec } from "../core/hosts";
 import { humanBytes } from "../core/output";
-import { buildDialog, type DialogButton, OVERLAY_OPTIONS, type RenderHost } from "./dialog";
-import { withDialog } from "./focus";
-import { n, prose } from "./nodes";
+import { buildDialog, type DialogButton, OVERLAY_OPTIONS } from "./dialog";
+import { mount, n, prose, type View } from "./nodes";
 
 export type ApprovalDecision = "once" | "host" | "deny";
 
@@ -24,11 +22,7 @@ export type ApprovalRequest =
 
 const target = (h: HostSpec) => `${h.user}@${h.hostName}:${h.port}`;
 
-export function buildApprovalComponent(
-	_tui: RenderHost,
-	done: (d: ApprovalDecision) => void,
-	req: ApprovalRequest,
-): Component {
+export function buildApprovalComponent(done: (d: ApprovalDecision) => void, req: ApprovalRequest): View {
 	const buttons: (DialogButton<ApprovalDecision> | null)[] = [
 		{ label: "Allow once", act: "once", key: "y", value: "once" },
 	];
@@ -47,20 +41,12 @@ export function buildApprovalComponent(
 				title: req.sudo ? `Run command as root on ${req.host.id}?` : `Run command on ${req.host.id}?`,
 				body: [n("kv", { items: kv }), n("code", { text: req.command, lang: "bash" }), prose(req.reason)],
 				buttons,
-				ansi: [
-					`host: ${target(req.host)}`,
-					...(req.sudo ? ["as: root (sudo)"] : []),
-					...(req.cwd ? [`cwd: ${req.cwd}`] : []),
-					`$ ${req.command}`,
-					req.reason,
-				],
 				aliases: { n: "deny" },
 			},
 			done,
 		);
 	}
 	const verb = req.direction === "upload" ? "Upload to" : "Download from";
-	const arrow = req.direction === "upload" ? `${req.local} -> ${req.remote}` : `${req.remote} -> ${req.local}`;
 	const kv = [
 		{ k: "host", v: target(req.host) },
 		{ k: "files", v: `${req.files} (${humanBytes(req.totalBytes)})` },
@@ -74,7 +60,6 @@ export function buildApprovalComponent(
 			title: `${verb} ${req.host.id}?`,
 			body: [n("kv", { items: kv }), prose(req.reason)],
 			buttons,
-			ansi: [`host: ${target(req.host)}`, arrow, `${req.files} files (${humanBytes(req.totalBytes)}), ${req.existing} overwrites`, req.reason],
 			aliases: { n: "deny" },
 		},
 		done,
@@ -83,8 +68,6 @@ export function buildApprovalComponent(
 
 /** Resolves to `deny` when the overlay is dismissed without a choice. */
 export async function openApproval(ctx: ExtensionContext, req: ApprovalRequest): Promise<ApprovalDecision> {
-	const result = await withDialog(() =>
-		ctx.ui.custom<ApprovalDecision>((tui, _theme, _kb, done) => buildApprovalComponent(tui, done, req), OVERLAY_OPTIONS),
-	);
+	const result = await ctx.ui.custom<ApprovalDecision>((_ui, _theme, _kb, done) => mount(() => buildApprovalComponent(done, req)), OVERLAY_OPTIONS);
 	return result ?? "deny";
 }

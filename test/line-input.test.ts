@@ -1,41 +1,45 @@
 import { describe, expect, test } from "bun:test";
+import type { KeyEvent } from "@oh-my-pi/pi-tui";
 import { LineInput } from "../src/ui/line-input";
+
+const k = (id: string, text?: string) => ({ id, text, kind: "press", raw: "" }) as KeyEvent;
 
 describe("LineInput", () => {
 	test("inserts at the cursor", () => {
 		const input = new LineInput("ac");
-		expect(input.handleInput("\x1b[D")).toBe(true);
-		expect(input.handleInput("b")).toBe(true);
+		expect(input.handleKey(k("left"))).toBe(true);
+		expect(input.handleKey(k("b", "b"))).toBe(true);
 		expect(input.value).toBe("abc");
 		expect(input.cursor).toBe(2);
 	});
 
 	test("backspace at position 0 is a no-op; delete removes under the cursor", () => {
 		const input = new LineInput("ab");
-		input.handleInput("\x1b[H");
-		expect(input.handleInput("\x7f")).toBe(true);
+		input.handleKey(k("home"));
+		expect(input.handleKey(k("backspace"))).toBe(true);
 		expect(input.value).toBe("ab");
-		input.handleInput("\x1b[3~");
+		input.handleKey(k("delete"));
 		expect(input.value).toBe("b");
 		expect(input.cursor).toBe(0);
 	});
 
-	test("bracketed paste drops newlines", () => {
+	test("paste drops newlines", () => {
 		const input = new LineInput();
-		input.handleInput("\x1b[200~ab\ncd\x1b[201~");
+		input.paste("ab\r\ncd");
 		expect(input.value).toBe("abcd");
 	});
 
 	test("unrelated keys are not consumed", () => {
 		const input = new LineInput("x");
-		expect(input.handleInput("\r")).toBe(false);
-		expect(input.handleInput("\x1b")).toBe(false);
-		expect(input.handleInput("\t")).toBe(false);
+		expect(input.handleKey(k("enter", "\r"))).toBe(false);
+		expect(input.handleKey(k("escape"))).toBe(false);
+		expect(input.handleKey(k("tab", "\t"))).toBe(false);
+		expect(input.handleKey(k("ctrl+c", "c"))).toBe(false);
 	});
 
 	test("ctrl+u clears", () => {
 		const input = new LineInput("abc");
-		input.handleInput("\x15");
+		input.handleKey(k("ctrl+u"));
 		expect(input).toMatchObject({ value: "", cursor: 0 });
 	});
 

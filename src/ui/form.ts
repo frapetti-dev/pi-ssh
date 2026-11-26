@@ -1,7 +1,7 @@
-/** Inline form for the Connection Manager: text fields and toggles, native tree plus ANSI lines. */
-import type { NativeNode } from "@oh-my-pi/pi-tui";
+/** Inline form for the Connection Manager: text fields and toggles as a native tree. */
+import type { JSXNode, KeyEvent } from "@oh-my-pi/pi-tui";
 import { LineInput } from "./line-input";
-import { bar, button, heading, isKey, n, prose, txt } from "./nodes";
+import { bar, button, heading, n, prose, txt } from "./nodes";
 
 export type Field =
 	| { kind: "text"; id: string; label: string; input: LineInput; placeholder?: string }
@@ -23,26 +23,31 @@ export class Form {
 		private readonly submitLabel: string,
 	) {}
 
-	handleInput(data: string): FormResult {
-		const result = this.route(data);
+	handleKey(key: KeyEvent): FormResult {
+		const result = this.route(key);
 		if (result !== "ignored") this.error = undefined;
 		return result;
 	}
 
-	private route(data: string): FormResult {
-		if (isKey(data, "escape")) return "cancel";
-		if (isKey(data, "tab") || isKey(data, "down")) return this.move(1);
-		if (isKey(data, "shift+tab") || isKey(data, "up")) return this.move(-1);
-		if (isKey(data, "enter")) return this.focus === this.fields.length - 1 ? "submit" : this.move(1);
+	private route(key: KeyEvent): FormResult {
+		if (key.id === "escape") return "cancel";
+		if (key.id === "tab" || key.id === "down") return this.move(1);
+		if (key.id === "shift+tab" || key.id === "up") return this.move(-1);
+		if (key.id === "enter") return this.focus === this.fields.length - 1 ? "submit" : this.move(1);
 		const field = this.fields[this.focus];
 		if (field?.kind === "toggle") {
-			if (isKey(data, "space")) {
+			if (key.id === "space") {
 				field.on = !field.on;
 				return "handled";
 			}
 			return "ignored";
 		}
-		return field?.input.handleInput(data) ? "handled" : "ignored";
+		return field?.input.handleKey(key) ? "handled" : "ignored";
+	}
+
+	handlePaste(text: string): void {
+		const field = this.fields[this.focus];
+		if (field?.kind === "text") field.input.paste(text);
 	}
 
 	private move(delta: number): FormResult {
@@ -80,7 +85,7 @@ export class Form {
 		return f?.kind === "toggle" && f.on;
 	}
 
-	describe(): NativeNode {
+	describe(): JSXNode {
 		const rows = this.fields.map((f, i) =>
 			n(
 				"row",
@@ -105,14 +110,5 @@ export class Form {
 			],
 			"form",
 		);
-	}
-
-	ansi(): string[] {
-		const lines = this.fields.map((f, i) => {
-			const mark = i === this.focus ? "> " : "  ";
-			return `${mark}${f.label}: ${f.kind === "text" ? f.input.display() : f.on ? "[x]" : "[ ]"}`;
-		});
-		if (this.error) lines.push(`  ${this.error}`);
-		return lines;
 	}
 }

@@ -1,20 +1,19 @@
 /**
  * Connection Manager: a persistent fullscreen screen (Hosts · Transfers · Security). Every interaction
  * (forms, confirms, live Transfers) happens inside it; only Approval, host-key and secret dialogs open
- * over it, and `registerPane` hands focus back when they close.
+ * over it.
  */
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { Component, DescribeContext, NativeNode, NativeScreen, NativeUiEvent, OverlayHandle } from "@oh-my-pi/pi-tui";
+import type { JSXNode, KeyEvent, UiEvent } from "@oh-my-pi/pi-tui";
 import type { HostSpec } from "../core/hosts";
-import type { KnownHostEntry } from "../core/known-hosts";
 import { exitLabel, humanBytes } from "../core/output";
+import type { KnownHostEntry } from "../core/known-hosts";
+
 import type { ExecDetails } from "../core/output";
 import type { TransferState } from "../core/progress";
-import type { RenderHost } from "./dialog";
-import { registerPane } from "./focus";
 import { Form, type FormResult, textField } from "./form";
 import { LineInput } from "./line-input";
-import { bar, button, fit, isClose, isKey, leafKey, Memo, n, txt } from "./nodes";
+import { bar, button, leafKey, mount, n, txt, type View } from "./nodes";
 import type { PaneHost, PaneModel, PlannedTransfer, RulesView } from "./pane-model";
 import { transferArrow } from "./widget";
 
@@ -23,11 +22,8 @@ export interface PaneOptions {
 	autoConnect?: boolean;
 }
 
-/** The Connection Manager component; `attach` receives the overlay handle used to regain focus. */
-export interface Pane extends Component {
-	dispose(): void;
-	attach(h: OverlayHandle): void;
-}
+/** The Connection Manager view. */
+export type Pane = View & { dispose(): void };
 
 type Tab = "hosts" | "transfers" | "security";
 type Purpose = "run" | "upload" | "download" | "new-host";
@@ -57,7 +53,6 @@ const TAB_ORDER: Tab[] = ["hosts", "transfers", "security"];
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 const target = (h: HostSpec) => `${h.user}@${h.hostName}:${h.port}${h.proxyJump ? ` via ${h.proxyJump}` : ""}`;
 const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
-const keyLabel = (k: string) => (k === "escape" ? "esc" : k);
 const seconds = (ms: number) => (ms / 1000).toFixed(1);
 
 function entryNote(e: KnownHostEntry): string {
@@ -65,7 +60,7 @@ function entryNote(e: KnownHostEntry): string {
 }
 
 export function buildPane(
-	tui: RenderHost,
+	refresh: () => void,
 	done: () => void,
 	model: PaneModel,
 	opts: PaneOptions,
@@ -82,7 +77,6 @@ export function buildPane(
 	let message: Message | undefined;
 	let version = 0;
 	let finished = false;
-	let unregister: (() => void) | undefined;
 
 	let hostsCache: { version: number; list: PaneHost[] } | undefined;
 	const allHosts = (): PaneHost[] => {
@@ -117,7 +111,7 @@ export function buildPane(
 		const grants = model.grants();
 		if (!grants.includes(selectedGrant)) selectedGrant = grants[0] ?? "";
 		loadKeys();
-		tui.requestRender();
+		refresh();
 	};
 
 	const task = (p: Promise<string | undefined>): void => {
@@ -147,7 +141,6 @@ export function buildPane(
 		if (finished) return;
 		finished = true;
 		unsub();
-		unregister?.();
 		for (const r of running.values()) r.controller.abort();
 	};
 	const finish = (): void => {
@@ -444,7 +437,7 @@ export function buildPane(
 
 	// ------------------------------------------------------------------- events
 
-	const onEvent = (e: NativeUiEvent): void => {
+	const handleEvent = (e: UiEvent): void => {
 		if (e.type === "select" || e.type === "activate") {
 			const leaf = leafKey(e.key);
 			if (leaf === "tabs") setTab(e.item as Tab);
@@ -463,41 +456,49 @@ export function buildPane(
 		bump();
 	};
 
-	const handleKey = (data: string): void => {
+	const handleKey = (key: KeyEvent): void => {
+		const id = key.id;
 		if (mode.kind === "confirm") {
-			if (data === "y") confirmAnswer(true);
-			else if (data === "n" || isKey(data, "escape")) confirmAnswer(false);
+			if (id === "y") confirmAnswer(true);
+			else if (id === "n" || id === "escape") confirmAnswer(false);
 			return;
 		}
 		if (mode.kind === "form") {
-			applyFormResult(mode.form.handleInput(data));
+			applyFormResult(mode.form.handleKey(key));
 			return;
 		}
 		if (filtering) {
-			if (isKey(data, "enter")) filtering = false;
-			else if (isKey(data, "escape")) {
+			if (id === "enter") filtering = false;
+			else if (id === "escape") {
 				filter.value = "";
 				filter.cursor = 0;
 				filtering = false;
-			} else if (isKey(data, "up")) move(-1);
-			else if (isKey(data, "down")) move(1);
-			else filter.handleInput(data);
+			} else if (id === "up") move(-1);
+			else if (id === "down") move(1);
+			else filter.handleKey(key);
 			return;
 		}
-		const digit = ["1", "2", "3"].indexOf(data);
+		const digit = ["1", "2", "3"].indexOf(id);
 		if (digit >= 0) return setTab(TAB_ORDER[digit]!);
-		if (isKey(data, "up")) return move(-1);
-		if (isKey(data, "down")) return move(1);
+		if (id === "up") return move(-1);
+		if (id === "down") return move(1);
 		const available = actions();
-		if (isKey(data, "enter") && tab === "hosts" && available.some(a => a.act === "connect")) return act("connect");
-		if (isClose(data) && !available.some(a => a.key === data && a.key !== "escape")) return finish();
-		const hit = available.find(a => (a.key === "escape" ? isKey(data, "escape") : a.key === data));
+		if (id === "enter" && tab === "hosts" && available.some(a => a.act === "connect")) return act("connect");
+		if ((id === "escape" || id === "q") && !available.some(a => a.key === id && a.key !== "escape")) return finish();
+		const hit = available.find(a => a.key === id);
 		if (hit) act(hit.act);
+	};
+
+	const handlePaste = (text: string): void => {
+		if (mode.kind === "form") mode.form.handlePaste(text);
+		else if (filtering) filter.paste(text);
+		else return;
+		bump();
 	};
 
 	// ----------------------------------------------------------------- describe
 
-	const hostsTab = (): NativeNode => {
+	const hostsTab = (): JSXNode => {
 		const sel = current();
 		const grants = new Set(model.grants());
 		const rows = visible().map(h => {
@@ -528,7 +529,7 @@ export function buildPane(
 
 		const newHost = mode.kind === "form" && mode.purpose === "new-host";
 		const head = newHost ? "New host" : (sel?.id ?? "(none)");
-		const kids: NativeNode[] = [];
+		const kids: JSXNode[] = [];
 		if (sel && !newHost) {
 			if (sel.error) kids.push(txt([{ t: sel.error, s: "error" }]));
 			const conn = model.connection(sel.id);
@@ -552,7 +553,7 @@ export function buildPane(
 				if (grants.has(sel.id)) kids.push(n("badge", { text: "always-allow", tone: "warning" }, undefined, "grant"));
 
 				const stored = keys.get(sel.id);
-				const keyRows: NativeNode[] = [];
+				const keyRows: JSXNode[] = [];
 				if (conn) {
 					keyRows.push(
 						n("kv", {
@@ -575,7 +576,7 @@ export function buildPane(
 		if (sel?.spec && !newHost) {
 			const live = running.get(sel.id);
 			const last = live?.partial ?? model.lastRun(sel.id);
-			const runKids: NativeNode[] = [];
+			const runKids: JSXNode[] = [];
 			if (live) runKids.push(n("spinner", { label: `Running ${live.command}` }, undefined, "running"));
 			if (last) {
 				runKids.push(
@@ -600,7 +601,7 @@ export function buildPane(
 		return n("row", { gap: "lg", align: "stretch" }, [left, n("card", { head, grow: 1 }, kids, "detail")], "hosts");
 	};
 
-	const transferRow = (t: TransferState): NativeNode => {
+	const transferRow = (t: TransferState): JSXNode => {
 		const head = [`${transferArrow(t)} ${t.label}`, t.hostId].map(s => txt(s));
 		const tail =
 			t.state === "running"
@@ -625,15 +626,15 @@ export function buildPane(
 		);
 	};
 
-	const transfersTab = (): NativeNode => {
+	const transfersTab = (): JSXNode => {
 		const list = model.transfers();
 		if (!list.length) return txt([{ t: "No Transfers in this omp session.", s: "muted" }]);
 		return n("list", {}, list.map(transferRow), "transfers");
 	};
 
-	const securityTab = (): NativeNode => {
+	const securityTab = (): JSXNode => {
 		const grants = model.grants();
-		const grantBody: NativeNode[] = grants.length
+		const grantBody: JSXNode[] = grants.length
 			? [
 					n(
 						"list",
@@ -643,7 +644,7 @@ export function buildPane(
 					),
 				]
 			: [txt([{ t: "No Host Grants. Choosing 'Always allow on this Host' in an Approval adds one.", s: "muted" }])];
-		const ruleBody: NativeNode[] = [];
+		const ruleBody: JSXNode[] = [];
 		if (!rules) ruleBody.push(n("spinner", { label: "Loading rules…" }, undefined, "rules-loading"));
 		else {
 			ruleBody.push(n("kv", { items: [{ k: "File", v: rules.path + (rules.exists ? "" : " (not created)") }] }));
@@ -673,35 +674,6 @@ export function buildPane(
 		);
 	};
 
-	const bodyMemo = new Memo();
-	const body: Component = {
-		describe(_cx: DescribeContext): NativeNode {
-			return bodyMemo.get([version], () => {
-				const active = activeCount();
-				const tabs = n(
-					"tabs",
-					{
-						items: [
-							{ id: "hosts", label: "Hosts" },
-							{ id: "transfers", label: `Transfers${active ? ` (${active})` : ""}` },
-							{ id: "security", label: "Security" },
-						],
-						active: tab,
-					},
-					undefined,
-					"tabs",
-				);
-				const content = tab === "hosts" ? hostsTab() : tab === "transfers" ? transfersTab() : securityTab();
-				return n("col", { gap: "md" }, [tabs, content], "body");
-			});
-		},
-		handleNativeEvent: onEvent,
-		render(): readonly string[] {
-			return [];
-		},
-		invalidate(): void {},
-	};
-
 	const hints = (): string =>
 		mode.kind === "form"
 			? "tab next field · enter submit · esc cancel"
@@ -709,13 +681,27 @@ export function buildPane(
 				? "y yes · n no"
 				: "↑↓ select · 1-3 tabs · / filter · esc close";
 
-	const rootMemo = new Memo();
-	const root: Pane = {
-		describeScreen(_cx: DescribeContext): NativeScreen {
-			return { role: "pi-ssh.screen", main: [body], dock: [root] };
-		},
-		describe(_cx: DescribeContext): NativeNode {
-			return rootMemo.get([version], () =>
+	const describe = (): JSXNode => {
+		const active = activeCount();
+		const tabs = n(
+			"tabs",
+			{
+				items: [
+					{ id: "hosts", label: "Hosts" },
+					{ id: "transfers", label: `Transfers${active ? ` (${active})` : ""}` },
+					{ id: "security", label: "Security" },
+				],
+				active: tab,
+			},
+			undefined,
+			"tabs",
+		);
+		const content = tab === "hosts" ? hostsTab() : tab === "transfers" ? transfersTab() : securityTab();
+		return n(
+			"col",
+			{ gap: "md" },
+			[
+				n("col", { gap: "md" }, [tabs, content], "body"),
 				n("col", { gap: "sm" }, [
 					n("status", {}, [
 						n("seg", { spans: [{ t: `${model.hosts().filter(h => model.connection(h.id)).length} connected · ${activeCount()} transferring` }], side: "left" }),
@@ -724,88 +710,38 @@ export function buildPane(
 					]),
 					bar(actions().map(a => button(a.label, a.act, a.key))),
 				]),
-			);
-		},
-		handleNativeEvent: onEvent,
-		handleInput(data: string): void {
+			],
+			"pane",
+		);
+	};
+
+	const pane: Pane = {
+		describe,
+		handleKey(key: KeyEvent): void {
 			if (finished) return;
 			message = undefined;
-			handleKey(data);
+			handleKey(key);
 			if (!finished) bump();
 		},
-		render(width: number): readonly string[] {
-			const connected = model.hosts().filter(h => model.connection(h.id)).length;
-			const tabLine = TAB_ORDER.map(t => {
-				const label = t[0]!.toUpperCase() + t.slice(1);
-				return t === tab ? `[${label}]` : label;
-			}).join(" ");
-			const lines = [`SSH  ${tabLine}  ·  ${connected} connected`];
-			if (tab === "hosts") {
-				if (filtering || filter.value) lines.push(`/ ${filter.value}`);
-				const list = visible();
-				for (const h of list) {
-					const state = model.connection(h.id) ? "*" : model.connecting(h.id) ? "~" : " ";
-					lines.push(`${h.id === selected ? ">" : " "} ${state} ${h.id} - ${h.error ?? (h.spec ? target(h.spec) : "")}`);
-				}
-				if (!list.length) lines.push("No hosts. Press n to add one.");
-				if (mode.kind === "form") lines.push(mode.form.title, ...mode.form.ansi());
-				else if (mode.kind === "confirm") lines.push(mode.text);
-				const live = running.get(selected);
-				const last = live?.partial ?? model.lastRun(selected);
-				if (last) {
-					lines.push(`exit ${live ? "running" : exitLabel(last)} · ${seconds(last.durationMs)}s · ${last.command}`);
-					lines.push(...last.stdout.split("\n").filter(Boolean).slice(-5));
-				}
-			} else if (tab === "transfers") {
-				const list = model.transfers();
-				if (!list.length) lines.push("No Transfers in this omp session.");
-				for (const t of list) {
-					if (t.state === "running") {
-						const pct = t.totalBytes > 0 ? Math.floor((t.doneBytes / t.totalBytes) * 100) : 0;
-						lines.push(`${transferArrow(t)} ${t.label} ${t.hostId} ${pct}% ${humanBytes(Math.round(t.bytesPerSec))}/s ${t.filesDone}/${t.files}`);
-					} else if (t.state === "done") lines.push(`${transferArrow(t)} ${t.label} ${t.hostId} done ${humanBytes(t.totalBytes)}`);
-					else lines.push(`${transferArrow(t)} ${t.label} ${t.hostId} error: ${t.error ?? "failed"}`);
-				}
-			} else {
-				const grants = model.grants();
-				if (!grants.length) lines.push("No Host Grants.");
-				for (const g of grants) lines.push(`${g === selectedGrant ? ">" : " "} ${g} (always-allow)`);
-				if (rules) {
-					lines.push(`Rules: ${rules.allow.length} allow, ${rules.deny.length} deny · ${rules.path}`);
-					if (rules.warning) lines.push(rules.warning);
-				} else lines.push("Loading rules…");
-			}
-			if (message) lines.push(message.text);
-			lines.push(actions().map(a => `[${keyLabel(a.key)}] ${a.label}`).join("  "));
-			return lines.map(l => fit(l, width));
-		},
-		invalidate(): void {},
-		dispose(): void {
-			teardown();
-		},
-		attach(h: OverlayHandle): void {
-			unregister?.();
-			unregister = registerPane(() => {
-				h.setHidden(true);
-				h.setHidden(false);
-				bump();
-			});
-		},
+		handlePaste,
+		handleEvent,
+		dispose: teardown,
 	};
 
 	if (opts.preselect) selected = opts.preselect;
 	bump();
 	if (opts.autoConnect && opts.preselect && actions().some(a => a.act === "connect")) act("connect");
-	return root;
+	return pane;
 }
 
 export async function openPane(ctx: ExtensionContext, model: PaneModel, opts: PaneOptions): Promise<void> {
 	let pane: Pane | undefined;
-	await ctx.ui.custom<void>(
-		(tui, _theme, _kb, done) => {
-			pane = buildPane(tui, done, model, opts);
-			return pane;
-		},
-		{ overlay: true, overlayOptions: { fullscreen: true }, onHandle: h => pane?.attach(h) },
-	);
+	try {
+		await ctx.ui.custom<void>(
+			(_ui, _theme, _kb, done) => mount(refresh => (pane = buildPane(refresh, done, model, opts))),
+			{ overlay: true, fullscreen: true },
+		);
+	} finally {
+		pane?.dispose();
+	}
 }
